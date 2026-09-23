@@ -45,7 +45,7 @@ M0 出口：`make test` 全绿 + `make build-linux` 产物在真实 Linux 容器
 | `doctor` @ 4.00.03 | 7 pass · 4 warn · 0 fail，退出码 0；`-Q` 不可用与退出码 8 异常均如实报出 |
 | `doctor` @ 4.6+（替身） | 10 pass · 1 warn · 0 fail；`-Q` 可用、hardcopy 可用两条 Pass 路径走通 |
 | `doctor` @ 4.00.03 + 会话（替身） | 11 项中 `-Q`/hardcopy 走 Warn 降级路径，措辞明确「不显示陈旧内容」 |
-| `package.sh` | 归档 + `SHA256SUMS` 生成，`shasum -c` 校验 OK，tar 内路径平铺 |
+| `package.sh` | **用真实产物**跑通：`stui-aarch64-macos.tar.gz` 390 KB + `stui-x86_64-macos.tar.gz` 416 KB + `SHA256SUMS`；`shasum -c` 校验 OK，tar 内平铺 `stui` + `INSTALL.txt`，解压后实跑 `--version` 输出 `stui 0.1.0`。**macOS 两个包当前即可下载使用** |
 
 **未完成 / 待补**
 
