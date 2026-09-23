@@ -1,0 +1,95 @@
+name: release
+
+# 打 v* tag 触发（tech-design §6.3）：Linux 走 cargo-zigbuild 容器出 musl 双架构，
+# macOS 本机编译，最后统一归档成 4 个 tar.gz + SHA256SUMS 附到 Release。
+# 「仅二进制下载」—— 不做安装脚本、不进包管理器。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # GHCR 上的 tag 不带 v 前缀；最高稳定版见 Makefile 注释
+  ZIGBUILD_IMG: ghcr.io/rust-cross/cargo-zigbuild:0.17.1
+
+jobs:
+  linux:
+    name: linux/${{ matrix.target }}
+    runs-on: ubuntu-latest
+    container: ghcr.io/rust-cross/cargo-zigbuild:0.17.1
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (static musl)
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Assert static
+        run: |
+          n=$(readelf -d target/${{ matrix.target }}/release/stui | grep -c NEEDED || true)
+          echo "DT_NEEDED=$n"
+          [ "$n" = "0" ]
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/stui
+          if-no-files-found: error
+
+  macos:
+    name: macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target aarch64-apple-darwin
+      - run: cargo build --release --target x86_64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: target/*/release/stui
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Arrange artifacts into dist/
+        run: |
+          set -eu
+          mkdir -p dist
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+                   aarch64-apple-darwin x86_64-apple-darwin; do
+            if [ -f "artifacts/$t/stui" ]; then
+              cp "artifacts/$t/stui" "dist/stui-$t"
+            elif [ -f "artifacts/macos/$t/stui" ]; then
+              cp "artifacts/macos/$t/stui" "dist/stui-$t"
+            fi
+          done
+          ls -l dist
+
+      - name: Package (tar.gz + SHA256SUMS)
+        run: VERSION="${GITHUB_REF_NAME#v}" scripts/package.sh
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/screen-tui-v*/stui-*.tar.gz
+            dist/screen-tui-v*/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

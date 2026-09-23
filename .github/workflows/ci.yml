@@ -1,0 +1,39 @@
+name: ci
+
+# T0.1 起生效的 CI 门禁（design/development-plan.md §6.2）：
+#   cargo fmt --check + clippy -D warnings + cargo test
+# 测试跑在 linux 原生，与发布 job 无关。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests (multi-version -ls fixtures included)
+        run: cargo test
+
+      - name: Release build smoke test
+        run: cargo build --release
