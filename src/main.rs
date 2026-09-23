@@ -8,10 +8,12 @@
 //! 故在此显式豁免 dead_code —— 有意保留的接口，不是遗忘的死代码。
 #![allow(dead_code)]
 
+mod app;
 mod cli;
 mod config;
 mod doctor;
 mod screen;
+mod ui;
 mod util;
 
 fn main() -> std::process::ExitCode {

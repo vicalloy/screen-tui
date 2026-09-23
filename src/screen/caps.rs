@@ -83,6 +83,27 @@ pub struct Caps {
     pub probe_notes: Vec<String>,
 }
 
+impl Default for Caps {
+    /// 「什么都没探测过」的中性默认值：全部能力 `Unknown`、无版本信息。
+    ///
+    /// 只用于单测构造与「探测不可用但需要继续降级运行」的场景；
+    /// 正常入口一律走 [`Caps::detect`]。
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from("screen"),
+            version_line: String::new(),
+            version: None,
+            version_text: None,
+            query: Support::Unknown,
+            hardcopy: Support::Unknown,
+            hardcopy_history: Support::Unknown,
+            mouse_sgr: false,
+            escape_prefix: "C-a".to_string(),
+            probe_notes: Vec::new(),
+        }
+    }
+}
+
 impl Caps {
     /// 探测版本，并在 `target` 可用时试跑一次 `-Q` 确认查询能力。
     ///

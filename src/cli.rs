@@ -69,10 +69,8 @@ pub fn run() -> ExitCode {
         Some(Command::Ls(args)) => ls(&args),
         Some(Command::Doctor) => doctor_command(),
         None => {
-            // M1 才交付 TUI。这里必须给出明确指引，而不是假装成功或抛一堆乱码。
-            eprintln!("stui: the interactive TUI is not implemented yet (milestone M1).");
-            eprintln!("      available now: `stui ls`, `stui doctor`");
-            ExitCode::from(EXIT_FAILURE)
+            // TUI（M1）：需要交互终端；非 TTY 下 app::run 会自行给出明确报错。
+            ExitCode::from(crate::app::run())
         }
     }
 }
