@@ -11,6 +11,7 @@
 | `ls-empty.txt` | **实测** 4.00.03 无会话 | `No Sockets found in <dir>.` 骨架 |
 | `ls-dead-unreachable.txt` | **推导**（手册状态词语义） | dead/unreachable/multi 的归类与「禁连」判定 |
 | `ls-malformed.txt` | 人工构造 | 空行、非数字 pid、空名、未知状态、超长名、重名、只有日期无状态、无括号行 |
+| `ls-cjk-emoji.txt` | 人工构造（T1.2） | 渲染层宽度测试：CJK / emoji / 超长名 / 四种状态；不新增解析语义 |
 | `ls-usage-dump.txt` | **实测** `screen -Q windows` 在 4.00.03 上的完整输出 | 必须返回 `Err`，不能被误解析成会话 |
 | `version-400c03.txt` | **实测**（保留原始 CRLF 行尾） | `Screen version 4.00.03 (FAU) 23-Oct-06` → `(4,0,3)` |
 | `version-40602.txt` | 推导 | `(4,6,2)` |

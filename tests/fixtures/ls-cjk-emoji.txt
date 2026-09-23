@@ -1,0 +1,6 @@
+There are screens on:
+	12345.会话列表	(09/23/2026 10:00:00 AM)	(Detached)
+	12346.🚀deploy	(09/23/2026 10:01:00 AM)	(Attached)
+	12347.very-long-session-name-for-truncation-testing	(09/23/2026 10:02:00 AM)	(Multi, detached)
+	12348.日本語のセッション	(09/23/2026 10:03:00 AM)	(Dead ???)
+4 Sockets in /tmp/.screen.

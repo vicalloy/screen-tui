@@ -135,6 +135,10 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             // 手动刷新重置自动轮询计时（refresh() 内统一更新 last_refresh）。
             KeyCode::Char('R') => self.refresh(),
+            // dead 清理（FR-01 验收 2 的提示入口）在 T2.4 落地；M1 给明确回执，不静默。
+            KeyCode::Char('W') => {
+                self.status = Some("session wipe is not implemented yet (planned for M2)".into());
+            }
             // Enter / 数字键 / n 的连接与新建语义在 T1.4/T1.5 接线。
             _ => {}
         }

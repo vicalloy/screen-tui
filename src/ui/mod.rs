@@ -13,8 +13,15 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::{App, Mode};
+
+pub mod list;
+pub mod theme;
 
 /// 信号 handler 置位的退出请求。事件循环每轮检查，走正常退出路径还原终端。
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -127,40 +134,149 @@ impl Drop for TuiGuard {
 /// 总绘制入口。只读 `app`，任何绘制路径不得引入副作用（tech-design §2.1）。
 pub fn render(f: &mut Frame<'_>, app: &App) {
     match app.mode {
-        Mode::List => render_list(f, app),
-        Mode::Help => render_help(f, app),
+        Mode::List => render_list_screen(f, app),
+        Mode::Help => render_help_overlay(f, app),
     }
 }
 
-fn render_list(f: &mut Frame<'_>, app: &App) {
-    // T1.1 骨架：正文直接铺满。页眉/页脚/图标列表在 T1.2 落成。
-    let rows: Vec<String> = app
-        .sessions()
-        .iter()
-        .enumerate()
-        .map(|(idx, s)| {
-            let cursor = if idx == app.selected { ">" } else { " " };
-            format!("{cursor} {:2} {} ({})", idx + 1, s.name, s.status.label())
-        })
-        .collect();
+/// 主列表屏：页眉 1 行 / 正文 / 页脚 1 行。
+fn render_list_screen(f: &mut Frame<'_>, app: &App) {
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(f.area());
 
-    let text = if rows.is_empty() {
-        "No screen sessions.".to_string()
-    } else {
-        rows.join("\n")
-    };
-
-    f.render_widget(ratatui::widgets::Paragraph::new(text), f.area());
+    f.render_widget(header_widget(app), header);
+    list::render(f, app, body);
+    f.render_widget(footer_widget(app), footer);
 }
 
-fn render_help(f: &mut Frame<'_>, _app: &App) {
-    // T1.1 骨架：占位弹层；正式按键表随 T1.2/T1.3 补齐。
-    let text = "Keys: j/k move  R refresh  q quit  Esc/? close";
+/// 页眉：工具名 + 会话统计 + screen 版本（数据缺失就少说，不编造）。
+fn header_widget(app: &App) -> Paragraph<'static> {
+    let sessions = app.sessions();
+    let attached = sessions
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status,
+                crate::screen::parse::Status::Attached | crate::screen::parse::Status::Multi
+            )
+        })
+        .count();
+    let dead = sessions
+        .iter()
+        .filter(|s| matches!(s.status, crate::screen::parse::Status::Dead))
+        .count();
+
+    let mut line = vec![
+        Span::styled(
+            " stui".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "  {} session(s) · {attached} attached",
+            sessions.len()
+        )),
+    ];
+    if dead > 0 {
+        line.push(Span::styled(
+            format!(" · {dead} dead"),
+            Style::default().fg(ratatui::style::Color::Red),
+        ));
+    }
+    if let Some(version) = &app.caps.version_text {
+        line.push(Span::styled(
+            format!("  ·  screen {version}"),
+            theme::dimmed(),
+        ));
+    }
+    Paragraph::new(Line::from(line))
+}
+
+/// 页脚：有瞬态消息时优先显示（刷新失败 / 动作结果），否则给按键提示。
+fn footer_widget(app: &App) -> Paragraph<'static> {
+    if let Some(status) = &app.status {
+        return Paragraph::new(Line::from(Span::styled(
+            status.clone(),
+            Style::default().fg(ratatui::style::Color::Red),
+        )));
+    }
+
+    let mut spans = vec![Span::styled(
+        " q quit  ? help  R refresh".to_string(),
+        theme::dimmed(),
+    )];
+    // dead 会话存在时提示清理入口（FR-01 验收 2）；`W` 在 M1 只给「未实现」回执，T2.4 落地。
+    if app
+        .sessions()
+        .iter()
+        .any(|s| matches!(s.status, crate::screen::parse::Status::Dead))
+    {
+        spans.push(Span::styled("  W wipe dead", theme::dimmed()));
+    }
+    Paragraph::new(Line::from(spans))
+}
+
+/// `?` 帮助弹层：居中模态，`Esc` / `q` / `?` 关闭。
+fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
+    // 先画底层列表，再叠弹层 —— 视觉上有上下文。
+    render_list_screen(f, app);
+
+    let area = centered_rect(f.area(), 46, 9);
+    let text = Line::from(vec![help_key("j/k / ↑/↓"), help_desc(" move selection")]);
+    let lines = vec![
+        text,
+        Line::from(vec![help_key("R"), help_desc("        refresh now")]),
+        Line::from(vec![help_key("?"), help_desc("        this help")]),
+        Line::from(vec![help_key("q / Esc"), help_desc("  quit / close")]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "screen {}",
+                app.caps
+                    .version_text
+                    .as_deref()
+                    .unwrap_or("version unknown")
+            ),
+            theme::dimmed(),
+        )),
+    ];
+    f.render_widget(Clear, area);
     f.render_widget(
-        ratatui::widgets::Paragraph::new(text)
-            .block(ratatui::widgets::Block::bordered().title(" Help ")),
-        f.area(),
+        Paragraph::new(lines).block(Block::bordered().title(" Help ")),
+        area,
     );
+}
+
+fn help_key(key: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {key:<8}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )
+}
+
+fn help_desc(desc: &str) -> Span<'static> {
+    Span::raw(desc.to_string())
+}
+
+/// 居中矩形：内容宽 `content_width`、高 `content_height`，四周留白。窄屏自动贴边收缩。
+fn centered_rect(
+    area: ratatui::layout::Rect,
+    content_width: u16,
+    content_height: u16,
+) -> ratatui::layout::Rect {
+    let w = content_width.min(area.width);
+    let h = content_height.min(area.height);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    ratatui::layout::Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 /// 后端类型别名（crossterm + stdout）。
@@ -169,4 +285,82 @@ pub type TuiTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdo
 /// 建立与 stdout 绑定的 ratatui 终端。
 pub fn new_terminal() -> io::Result<TuiTerminal> {
     ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::caps::Caps;
+    use crate::screen::parse::{self, Enumeration, Outlook};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ls-46-with-date.txt"
+    );
+
+    fn app_with_fixture() -> App {
+        let text = std::fs::read_to_string(FIXTURE).unwrap();
+        let list = parse::parse_list_output(&text).unwrap();
+        let mut app = App::new(Caps::default());
+        app.caps.version_text = Some("4.06.02".into());
+        app.apply_enumeration(Enumeration {
+            outlook: Outlook::Available(list.len() as u32),
+            list,
+            list_error: None,
+        });
+        app
+    }
+
+    fn draw(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal
+    }
+
+    fn line_at(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn header_shows_counts_and_version() {
+        let app = app_with_fixture();
+        let terminal = draw(&app, 80, 12);
+        let header = line_at(&terminal, 0);
+        assert!(header.contains("stui"));
+        assert!(header.contains("session(s)"));
+        assert!(header.contains("attached"));
+        // fixture 版本行是 4.6+，版本号应出现在页眉。
+        assert!(header.contains("4.06.02"), "header: {header:?}");
+    }
+
+    #[test]
+    fn footer_shows_hints_or_status_message() {
+        let mut app = app_with_fixture();
+        let terminal = draw(&app, 80, 12);
+        let last = 11u16;
+        assert!(line_at(&terminal, last).contains("q quit"));
+
+        // 有瞬态消息时页脚整行让位给消息。
+        app.status = Some("refresh failed: boom".into());
+        let terminal = draw(&app, 80, 12);
+        assert!(line_at(&terminal, last).contains("refresh failed: boom"));
+        assert!(!line_at(&terminal, last).contains("q quit"));
+    }
+
+    #[test]
+    fn help_overlay_renders_on_top_of_list() {
+        let mut app = app_with_fixture();
+        app.mode = Mode::Help;
+        let terminal = draw(&app, 80, 12);
+        let all: String = (0..12u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(all.contains(" Help "), "bordered title: {all:?}");
+        assert!(all.contains("move selection"));
+        // 底层列表仍然可见（弹层居中，四周留白露出列表）。
+        assert!(all.contains("stui"));
+    }
 }
