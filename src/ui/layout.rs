@@ -97,7 +97,11 @@ impl RowCols {
 /// 一条会话在给定档位下可展示的全部字段（详情面板与 `i` 弹层共用）。
 ///
 /// 取不到的字段直接不出现该行 —— 显示「无」就是编造（C-5）。
-pub fn detail_lines(session: &SessionRecord) -> Vec<String> {
+/// `meta` 是 T2.2 的探测结果（cwd / command），`None` 时两行都不出现。
+pub fn detail_lines(
+    session: &SessionRecord,
+    meta: Option<&crate::screen::probe::Meta>,
+) -> Vec<String> {
     let mut lines = vec![format!("name      {}", session.name)];
     lines.push(format!("address   {}", session.full));
     if let Some(pid) = session.pid {
@@ -106,6 +110,14 @@ pub fn detail_lines(session: &SessionRecord) -> Vec<String> {
     lines.push(format!("status    {}", session.status.label()));
     if let Some(created) = &session.created {
         lines.push(format!("created   {created}"));
+    }
+    if let Some(meta) = meta {
+        if let Some(cwd) = &meta.cwd {
+            lines.push(format!("cwd       {cwd}"));
+        }
+        if let Some(command) = &meta.command {
+            lines.push(format!("command   {command}"));
+        }
     }
     lines
 }
@@ -156,8 +168,19 @@ mod tests {
             created: Some("08/09/2026 10:23:45 AM".into()),
             status: crate::screen::parse::Status::Detached,
         };
-        let lines = detail_lines(&full);
+        let lines = detail_lines(&full, None);
         assert!(lines.iter().any(|l| l.contains("created")));
+        // 探测结果缺失时 cwd / command 两行整体不出现（C-5）。
+        assert!(!lines.iter().any(|l| l.starts_with("cwd")));
+        assert!(!lines.iter().any(|l| l.starts_with("command")));
+
+        let meta = crate::screen::probe::Meta {
+            cwd: Some("/srv/app".into()),
+            command: Some("claude".into()),
+        };
+        let lines = detail_lines(&full, Some(&meta));
+        assert!(lines.iter().any(|l| *l == "cwd       /srv/app"));
+        assert!(lines.iter().any(|l| *l == "command   claude"));
 
         let bare = SessionRecord {
             full: "67890.llm".into(),
@@ -166,7 +189,7 @@ mod tests {
             created: None,
             status: crate::screen::parse::Status::Attached,
         };
-        let lines = detail_lines(&bare);
+        let lines = detail_lines(&bare, None);
         assert!(!lines.iter().any(|l| l.starts_with("pid")));
         assert!(!lines.iter().any(|l| l.starts_with("created")));
     }

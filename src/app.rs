@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::screen::caps::Caps;
 use crate::screen::cmd::{self, AttachKind};
 use crate::screen::parse::{self, Enumeration, SessionRecord, Status};
+use crate::screen::probe;
 use crate::ui;
 use crate::util::time::local_label;
 
@@ -186,6 +187,10 @@ pub struct App {
     pub status: Option<String>,
     /// 新建向导草稿；仅在 `Mode::NewSession` 期间非空。
     pub draft: Option<NewDraft>,
+    /// 元数据探测缓存（T2.2）：详情/过滤按 pid 取，refresh 后选中项强制重探。
+    pub meta_cache: probe::MetaCache,
+    /// 选中会话的元数据（cwd / command，取不到为 `None` → UI 隐藏字段，C-5）。
+    pub meta: Option<probe::Meta>,
     /// attached 冲突选择框状态；仅在 `Mode::AttachChoice` 期间非空。
     pub attach: Option<AttachChoice>,
     /// 待事件循环消费的连接请求（`take_attach_request` 取走后执行前台连接）。
@@ -211,6 +216,8 @@ impl App {
             selected: 0,
             status: None,
             draft: None,
+            meta_cache: probe::MetaCache::default(),
+            meta: None,
             attach: None,
             attach_request: None,
             should_quit: false,
@@ -247,6 +254,19 @@ impl App {
             }
         }
         self.last_refresh = Some(Instant::now());
+        self.refresh_meta();
+    }
+
+    /// 重新探测选中会话的元数据（T2.2）。探测失败只影响展示字段，不影响主流程。
+    fn refresh_meta(&mut self) {
+        self.meta = None;
+        if let Some(session) = self.sessions().get(self.selected)
+            && let Some(pid) = session.pid
+            && let Ok(pid) = u32::try_from(pid)
+        {
+            self.meta_cache.invalidate(pid);
+            self.meta = self.meta_cache.get(pid).cloned();
+        }
     }
 
     fn clamp_selection(&mut self) {

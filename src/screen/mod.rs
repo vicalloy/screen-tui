@@ -6,6 +6,7 @@
 pub mod caps;
 pub mod cmd;
 pub mod parse;
+pub mod probe;
 
 /// 状态类型在适配层根上再导出一份，供上层免于深路径引用。
 pub use parse::Status;

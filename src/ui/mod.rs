@@ -385,7 +385,7 @@ fn render_detail_overlay(f: &mut Frame<'_>, app: &App) {
     let Some(session) = app.sessions().get(app.selected) else {
         return; // 无会话时列表层已给空态，弹层不画。
     };
-    let lines = detail::detail_lines(session);
+    let lines = detail::detail_lines(session, app.meta.as_ref());
     let height = lines.len() as u16 + 2; // + 边框
     // 用显示宽度算盒宽：CJK 名字 chars().count() 会低估列数导致折行（NFR-06）。
     let width = lines
