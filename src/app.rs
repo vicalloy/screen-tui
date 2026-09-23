@@ -4,19 +4,25 @@
 //! 渲染层只读 `App`；`App` 的按键处理是纯状态变更（除显式标注的动作外不碰进程环境），
 //! 因此可脱离终端做单测。
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
 use crate::screen::caps::Caps;
+use crate::screen::cmd;
 use crate::screen::parse::{self, Enumeration, SessionRecord};
 use crate::ui;
+use crate::util::time::local_label;
 
 /// 刷新间隔（FR-19：默认 3 秒，介于 spv 的 1s 与 screen-manager 的 5s 之间）。
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 /// 事件轮询的最大等待。同时封顶「响应外部信号」的延迟。
 const POLL_CAP: Duration = Duration::from_millis(200);
+
+/// 会话名上限。screen 的 socket 文件名是 `<pid>.<name>`，80 字符留足余量（FR-02 验收 2）。
+pub const NAME_MAX: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -26,6 +32,109 @@ pub enum Mode {
     Help,
     /// `i` 详情弹层（窄屏的主要信息入口，FR-05）。
     Detail,
+    /// `n` 新建会话三步向导（FR-02）。
+    NewSession,
+}
+
+/// 向导步骤：名 → 目录 → 命令，每步回车即接受默认值（FR-02 验收 1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewStep {
+    Name,
+    Dir,
+    Command,
+}
+
+impl NewStep {
+    pub fn index(self) -> usize {
+        match self {
+            NewStep::Name => 0,
+            NewStep::Dir => 1,
+            NewStep::Command => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NewStep::Name => "Name",
+            NewStep::Dir => "Directory",
+            NewStep::Command => "Command",
+        }
+    }
+}
+
+/// 新建向导的草稿状态。`error` 是阻断性错误（停在当前步），`note` 是非阻断提示
+/// （如重名提示 —— FR-02 验收 2 允许重名创建，但提示寻址方式）。
+///
+/// 不派生 `Default`：`NewStep` 没有合理初值，向导一律经 `open_new_session()` 显式构造。
+#[derive(Debug, Clone)]
+pub struct NewDraft {
+    pub step: NewStep,
+    pub name: String,
+    pub dir: String,
+    pub command: String,
+    pub error: Option<String>,
+    pub note: Option<String>,
+}
+
+/// 会话名校验（纯函数）：空名 / 前导 `-`（会被 screen 当选项）/ 空白与控制字符 /
+/// 超长即时报错；重名不在此拦 —— 见 `NewDraft::note`。
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name must not be empty".into());
+    }
+    if name.starts_with('-') {
+        return Err("name must not start with '-' (screen would read it as an option)".into());
+    }
+    if let Some(bad) = name.chars().find(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!(
+            "name must not contain whitespace or control characters (found {bad:?})"
+        ));
+    }
+    if name.chars().count() > NAME_MAX {
+        return Err(format!("name is longer than {NAME_MAX} characters"));
+    }
+    Ok(())
+}
+
+/// 默认会话名：`<当前目录名>-<MMDD-HHMM>`（FR-02 验收 1）。
+///
+/// 目录名先过一遍与 `validate_name` 同口径的清洗（空白 → `-`），保证默认值必过校验。
+pub fn default_session_name(dir: &std::path::Path, now: std::time::SystemTime) -> String {
+    let base = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session".into());
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_whitespace() { '-' } else { c })
+        .collect();
+    let label = local_label(now);
+    if label.is_empty() {
+        cleaned
+    } else {
+        format!("{cleaned}-{label}")
+    }
+}
+
+/// 默认命令：`$SHELL`（非空时），否则 `/bin/sh`。
+pub fn default_command() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".into())
+}
+
+/// 展开 `~` 前缀（仅 `~` 与 `~/` 两种形态；其余 `~user` 不支持，原样保留交给报错）。
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| path.into());
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty())
+    {
+        return format!("{home}/{rest}");
+    }
+    path.to_string()
 }
 
 pub struct App {
@@ -37,6 +146,8 @@ pub struct App {
     pub selected: usize,
     /// 页脚瞬态消息（刷新失败、动作结果等），不弹窗打扰。
     pub status: Option<String>,
+    /// 新建向导草稿；仅在 `Mode::NewSession` 期间非空。
+    pub draft: Option<NewDraft>,
     pub should_quit: bool,
     pub refresh_interval: Duration,
     last_refresh: Option<Instant>,
@@ -50,6 +161,7 @@ impl App {
             enumeration: None,
             selected: 0,
             status: None,
+            draft: None,
             should_quit: false,
             refresh_interval: REFRESH_INTERVAL,
             last_refresh: None,
@@ -132,6 +244,7 @@ impl App {
         match self.mode {
             Mode::List => self.on_key_list(key.code),
             Mode::Help | Mode::Detail => self.on_key_overlay(key.code),
+            Mode::NewSession => self.on_key_new(key.code),
         }
     }
 
@@ -154,7 +267,8 @@ impl App {
             KeyCode::Char('W') => {
                 self.status = Some("session wipe is not implemented yet (planned for M2)".into());
             }
-            // Enter / 数字键 / n 的连接与新建语义在 T1.4/T1.5 接线。
+            KeyCode::Char('n') => self.open_new_session(),
+            // 连接（Enter / 数字键）在 T1.5 接线。
             _ => {}
         }
     }
@@ -167,6 +281,173 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    // ------------------------------------------------------------- 新建会话（T1.4）
+
+    /// 打开三步向导：预填当前目录、默认名、`$SHELL`（FR-02 验收 1）。
+    pub fn open_new_session(&mut self) {
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        self.draft = Some(NewDraft {
+            step: NewStep::Name,
+            name: default_session_name(&dir, std::time::SystemTime::now()),
+            dir: dir.display().to_string(),
+            command: default_command(),
+            error: None,
+            note: None,
+        });
+        self.mode = Mode::NewSession;
+    }
+
+    fn on_key_new(&mut self, code: KeyCode) {
+        let Some(draft) = &mut self.draft else {
+            // 草稿丢失（不应发生）：回到列表而不是卡死。
+            self.mode = Mode::List;
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.draft = None;
+                self.mode = Mode::List;
+            }
+            KeyCode::Enter => self.advance_new(),
+            KeyCode::Backspace => {
+                draft.error = None;
+                let field = current_field_mut(draft);
+                field.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                draft.error = None;
+                let field = current_field_mut(draft);
+                field.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// 回车推进：当前步校验通过后进入下一步；最后一步触发真实创建。
+    fn advance_new(&mut self) {
+        let Some(mut draft) = self.draft.take() else {
+            self.mode = Mode::List;
+            return;
+        };
+
+        match draft.step {
+            NewStep::Name => {
+                draft.name = draft.name.trim().to_string();
+                if let Err(err) = validate_name(&draft.name) {
+                    draft.error = Some(err);
+                    self.draft = Some(draft);
+                    return;
+                }
+                draft.note = self.duplicate_note(&draft.name);
+                draft.error = None;
+                draft.step = NewStep::Dir;
+                self.draft = Some(draft);
+            }
+            NewStep::Dir => {
+                draft.dir = expand_tilde(draft.dir.trim());
+                if draft.dir.is_empty() {
+                    draft.error = Some("directory must not be empty".into());
+                    self.draft = Some(draft);
+                    return;
+                }
+                if !std::path::Path::new(&draft.dir).is_dir() {
+                    draft.error = Some(format!("not a directory: {}", draft.dir));
+                    self.draft = Some(draft);
+                    return;
+                }
+                draft.error = None;
+                draft.step = NewStep::Command;
+                self.draft = Some(draft);
+            }
+            NewStep::Command => {
+                draft.command = draft.command.trim().to_string();
+                if draft.command.is_empty() {
+                    draft.error = Some("command must not be empty".into());
+                    self.draft = Some(draft);
+                    return;
+                }
+                let name = draft.name.clone();
+                let dir = draft.dir.clone();
+                let command = draft.command.clone();
+                let note = draft.note.take();
+
+                match self.create_session(&name, &dir, &command) {
+                    Ok(selected) => {
+                        // 成功：草稿丢弃，回列表，选中并确认新会话（FR-02 验收 5）。
+                        self.draft = None;
+                        self.mode = Mode::List;
+                        self.selected = selected;
+                        self.status = Some(match note {
+                            Some(hint) => format!("created '{name}' ({hint})"),
+                            None => format!("created '{name}'"),
+                        });
+                        self.refresh();
+                    }
+                    Err(message) => {
+                        // 失败：草稿保留在最后一步，可行动报错，不静默（FR-02 验收 4）。
+                        draft.error = Some(message);
+                        self.draft = Some(draft);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 重名提示（非阻断）：FR-02 验收 2 —— 允许创建，提示「将以 `<pid>.<name>` 寻址」。
+    fn duplicate_note(&self, name: &str) -> Option<String> {
+        self.sessions()
+            .iter()
+            .any(|s| s.name == name)
+            .then(|| format!("a session named '{name}' already exists; address it as <pid>.{name}"))
+    }
+
+    /// 执行创建并刷新列表。成功返回新会话在（刷新后）列表中的下标。
+    fn create_session(&mut self, name: &str, dir: &str, command: &str) -> Result<usize, String> {
+        let path = std::path::PathBuf::from(dir);
+        let run =
+            cmd::create(name, &path, command).map_err(|err| format!("create failed: {err}"))?;
+
+        if !run.success() {
+            let detail = run.text();
+            let detail = detail.trim();
+            return Err(format!(
+                "screen refused to create '{name}' (exit {}):\n  {} ran in {dir}\n  {}",
+                run.code,
+                run.command,
+                if detail.is_empty() {
+                    "screen produced no diagnostic output; check the name and directory"
+                } else {
+                    detail
+                }
+            ));
+        }
+
+        // 创建成功后立刻重枚举，把选中项对准新会话（FR-02 验收 5）。
+        match parse::enumerate() {
+            Ok(enumeration) => {
+                let index = enumeration
+                    .list
+                    .sessions
+                    .iter()
+                    .position(|s| s.name == name);
+                self.apply_enumeration(enumeration);
+                // 绕过了 refresh()，这里补计时起点，避免下一轮立即重复枚举。
+                self.last_refresh = Some(Instant::now());
+                Ok(index.unwrap_or(0))
+            }
+            Err(_) => Ok(0), // 列表刷新失败不回滚创建本身；下个轮询周期自会补上。
+        }
+    }
+}
+
+/// 当前草稿步对应的可编辑字段。
+fn current_field_mut(draft: &mut NewDraft) -> &mut String {
+    match draft.step {
+        NewStep::Name => &mut draft.name,
+        NewStep::Dir => &mut draft.dir,
+        NewStep::Command => &mut draft.command,
     }
 }
 
@@ -371,5 +652,160 @@ mod tests {
         app.on_key(key(KeyCode::Char('j')));
         app.on_key(key(KeyCode::Char('k')));
         assert_eq!(app.selected, 0);
+    }
+
+    // ------------------------------------------------------------- T1.4 新建向导
+
+    #[test]
+    fn name_validation_rejects_the_documented_cases() {
+        assert!(validate_name("work").is_ok());
+        assert!(validate_name("a.b_c-d").is_ok());
+        // 空名。
+        assert!(validate_name("").is_err());
+        // 前导 `-` 会被 screen 当选项。
+        assert!(validate_name("-rf").is_err());
+        // 空白与控制字符。
+        assert!(validate_name("a b").is_err());
+        assert!(validate_name("a\nb").is_err());
+        // 超长。
+        assert!(validate_name(&"a".repeat(NAME_MAX)).is_ok());
+        assert!(validate_name(&"a".repeat(NAME_MAX + 1)).is_err());
+    }
+
+    #[test]
+    fn default_name_is_dirname_plus_timestamp() {
+        let now = std::time::SystemTime::now();
+        let name = default_session_name(std::path::Path::new("/Users/x/my proj"), now);
+        // 空格被清洗成 `-`，保证默认值必过校验（FR-02 验收 1）。
+        assert!(name.starts_with("my-proj-"), "{name}");
+        assert!(validate_name(&name).is_ok(), "{name}");
+        // `MMDD-HHMM` 尾巴。
+        let tail = &name["my-proj-".len()..];
+        assert_eq!(tail.len(), 9, "{name}");
+        assert_eq!(tail.as_bytes()[4], b'-');
+    }
+
+    #[test]
+    fn tilde_expands_only_known_forms() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return; // 无 HOME 的环境跳过（分支行为已由调用方兜底）。
+        }
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/work"), format!("{home}/work"));
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        // `~user` 不支持，原样保留（交给目录存在性检查报错）。
+        assert_eq!(expand_tilde("~root/x"), "~root/x");
+    }
+
+    #[test]
+    fn wizard_opens_with_prefilled_defaults() {
+        let mut app = app_with(FOUR);
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.mode, Mode::NewSession);
+        let draft = app.draft.as_ref().expect("draft created");
+        assert_eq!(draft.step, NewStep::Name);
+        assert!(!draft.name.is_empty());
+        assert!(
+            validate_name(&draft.name).is_ok(),
+            "default must pass: {}",
+            draft.name
+        );
+        assert_eq!(draft.command, default_command());
+        // 再按 n 不叠加草稿。
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Name);
+    }
+
+    #[test]
+    fn wizard_esc_cancels_and_returns_to_list() {
+        let mut app = app_with(FOUR);
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.draft.is_none());
+    }
+
+    #[test]
+    fn wizard_input_edits_only_the_current_step() {
+        let mut app = app_with(FOUR);
+        app.open_new_session();
+        let original_name = app.draft.as_ref().unwrap().name.clone();
+
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.draft.as_ref().unwrap().name,
+            format!("{original_name}x")
+        );
+
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.draft.as_ref().unwrap().name, original_name);
+
+        // 目录步里输入不会误改名字。
+        app.draft.as_mut().unwrap().step = NewStep::Dir;
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(app.draft.as_ref().unwrap().dir.ends_with('/'));
+        assert_eq!(app.draft.as_ref().unwrap().name, original_name);
+    }
+
+    #[test]
+    fn wizard_rejects_invalid_name_and_stays_on_step() {
+        let mut app = app_with(FOUR);
+        app.open_new_session();
+        app.draft.as_mut().unwrap().name = "-bad".into();
+
+        app.on_key(key(KeyCode::Enter));
+        let draft = app.draft.as_ref().unwrap();
+        assert_eq!(draft.step, NewStep::Name, "stays on the name step");
+        assert!(draft.error.is_some(), "reports the reason");
+    }
+
+    #[test]
+    fn wizard_advances_through_valid_steps() {
+        let mut app = app_with(FOUR);
+        app.open_new_session();
+
+        app.on_key(key(KeyCode::Enter)); // 默认名合法 → Dir
+        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Dir);
+
+        app.on_key(key(KeyCode::Enter)); // 默认目录合法 → Command
+        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Command);
+        // 不真实创建：到此为止，Esc 退出。
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::List);
+    }
+
+    #[test]
+    fn duplicate_name_gets_a_note_but_is_allowed() {
+        let mut app = app_with(FOUR); // 含 work / llm / dep / legacy
+        app.open_new_session();
+        app.draft.as_mut().unwrap().name = "work".into();
+
+        app.on_key(key(KeyCode::Enter));
+        let draft = app.draft.as_ref().unwrap();
+        assert_eq!(draft.step, NewStep::Dir, "duplicate does not block");
+        assert!(draft.error.is_none());
+        let note = draft.note.as_deref().expect("duplicate note set");
+        assert!(note.contains("<pid>.work"), "{note}");
+    }
+
+    #[test]
+    fn nonexistent_dir_is_rejected_before_creation() {
+        let mut app = app_with(FOUR);
+        app.open_new_session();
+        let draft = app.draft.as_mut().unwrap();
+        draft.step = NewStep::Dir;
+        draft.dir = "/no/such/dir/stui-test".into();
+
+        app.on_key(key(KeyCode::Enter));
+        let draft = app.draft.as_ref().unwrap();
+        assert_eq!(draft.step, NewStep::Dir);
+        assert!(
+            draft
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not a directory")
+        );
     }
 }

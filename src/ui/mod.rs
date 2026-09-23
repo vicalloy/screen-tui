@@ -24,6 +24,7 @@ use crate::ui::layout::Tier;
 pub mod detail;
 pub mod layout;
 pub mod list;
+pub mod new;
 pub mod theme;
 
 /// 信号 handler 置位的退出请求。事件循环每轮检查，走正常退出路径还原终端。
@@ -140,6 +141,12 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
         Mode::List => render_list_screen(f, app),
         Mode::Help => render_help_overlay(f, app),
         Mode::Detail => render_detail_overlay(f, app),
+        Mode::NewSession => {
+            render_list_screen(f, app);
+            if let Some(draft) = &app.draft {
+                new::render_overlay(f, draft);
+            }
+        }
     }
 }
 
@@ -221,7 +228,7 @@ fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout
         // 中屏 / 窄屏：1 行精简。
         Tier::Mid | Tier::Narrow => {
             let mut spans = vec![Span::styled(
-                " j/k move  i detail  ? help  q quit".to_string(),
+                " j/k move  n new  i detail  ? help  q quit".to_string(),
                 theme::dimmed(),
             )];
             if has_dead && tier == Tier::Mid {
@@ -352,7 +359,7 @@ fn help_desc(desc: &str) -> Span<'static> {
 }
 
 /// 居中矩形：内容宽 `content_width`、高 `content_height`，四周留白。窄屏自动贴边收缩。
-fn centered_rect(
+pub(crate) fn centered_rect(
     area: ratatui::layout::Rect,
     content_width: u16,
     content_height: u16,
@@ -382,6 +389,7 @@ mod tests {
     use super::*;
     use crate::screen::caps::Caps;
     use crate::screen::parse::{self, Enumeration, Outlook};
+    use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -452,6 +460,34 @@ mod tests {
         assert!(all.contains("move selection"));
         // 底层列表仍然可见（弹层居中，四周留白露出列表）。
         assert!(all.contains("stui"));
+    }
+
+    #[test]
+    fn new_session_wizard_renders_steps_input_and_error() {
+        let mut app = app_with_fixture();
+        app.open_new_session();
+
+        // 第 1 步：步骤指示 + 名字输入回显。
+        let terminal = draw(&app, 80, 20);
+        let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(all.contains(" New session "), "{all:?}");
+        assert!(all.contains("[1 Name]"), "{all:?}");
+        assert!(all.contains("Name: "), "{all:?}");
+
+        // 名字步报错：错误文本出现在弹层里。
+        app.draft.as_mut().unwrap().name = "-bad".into();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::NewSession);
+        let terminal = draw(&app, 80, 20);
+        let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(
+            all.contains("must not start with '-'"),
+            "error is visible: {all:?}"
+        );
+    }
+
+    fn key(code: ratatui::crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
     }
 
     /// 8 条会话的 `-ls` 输出（FR-05 验收 1 用：40×20 首屏 ≥5 条）。
