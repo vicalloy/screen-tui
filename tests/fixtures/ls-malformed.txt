@@ -1,0 +1,13 @@
+There are screens on:
+
+	(Detached)
+	notanumber.alpha	(Detached)
+	555.malformed	(Weird State)
+	666.	(Detached)
+	777.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	(Detached)
+	888.dup	(Detached)
+	999.dup	(Detached)
+	123.onlydate	(08/09/2026 10:00:00 AM)
+this line has no state marker at all
+4 Sockets in /run/screen/S-huxm.
+garbage trailing line (

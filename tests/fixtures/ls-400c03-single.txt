@@ -1,0 +1,3 @@
+There is a screen on:
+	11121.ttys002.MacBook-Pro-3	(Detached)
+1 Socket in /var/folders/vp/hvhc4_b90s92slrx__l_42kw0000gn/T/.screen.

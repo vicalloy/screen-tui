@@ -1,0 +1,6 @@
+There are screens on:
+	111.legacy	(Dead ???)
+	222.remote	(Unreachable)
+	333.phone	(Multi, attached)
+	444.idle	(Detached)
+4 Sockets in /run/screen/S-huxm.
