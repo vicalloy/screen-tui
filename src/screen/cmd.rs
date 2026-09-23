@@ -198,6 +198,72 @@ fn shell_quote(raw: &str) -> String {
     }
 }
 
+/// 连接方式（FR-03）。`Takeover` 用 `-d -r`——**绝不用 `-D -r`**（会把其它
+/// 显示器全部踢下电，需求明令禁止）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachKind {
+    /// `-r`：连接 detached 会话。
+    Resume,
+    /// `-x`：共享连接（会话已被 attach 时）。
+    Share,
+    /// `-d -r`：先 detach 再连接（接管）。
+    Takeover,
+}
+
+impl AttachKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            AttachKind::Resume => "resume",
+            AttachKind::Share => "share (-x)",
+            AttachKind::Takeover => "takeover (-d -r)",
+        }
+    }
+}
+
+/// 连接参数拼装（纯函数）。三种方式都带 `-U`（UTF-8）。
+pub fn attach_args(kind: AttachKind, target: &str) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["-U".into()];
+    match kind {
+        AttachKind::Resume => args.push("-r".into()),
+        AttachKind::Share => args.push("-x".into()),
+        AttachKind::Takeover => {
+            args.push("-d".into());
+            args.push("-r".into());
+        }
+    }
+    args.push(target.into());
+    args
+}
+
+/// 前台连接：继承 stdio 阻塞到子进程退出（1.5d）。调用方负责先 suspend 终端。
+pub fn attach(kind: AttachKind, target: &str) -> Result<Run> {
+    let program = program()?;
+    attach_with(&program, kind, target)
+}
+
+/// [`attach`] 的注入版：替身测试不碰真实 screen。
+///
+/// 用 `.status()` 而非 `.output()` —— 连接是交互式的，stdio 必须直通终端；
+/// 因此拿不到子进程输出文本，退出码是唯一可信凭据。
+pub fn attach_with(program: &Path, kind: AttachKind, target: &str) -> Result<Run> {
+    let args = attach_args(kind, target);
+    let status = Command::new(program)
+        .args(&args)
+        .env_remove("STY") // 与 create 同理：嵌套时 screen 拒绝。
+        .status()
+        .map_err(|source| Error::Spawn {
+            program: program.display().to_string(),
+            source,
+        })?;
+
+    Ok(Run {
+        command: display_command(program, &args),
+        code: status.code().unwrap_or(-1),
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +380,81 @@ mod tests {
         assert!(!run.success());
         assert_eq!(run.code, 1);
         assert!(run.stderr.contains("boom"), "{}", run.stderr);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn attach_args_cover_the_three_kinds() {
+        let flat = |kind| {
+            attach_args(kind, "work")
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flat(AttachKind::Resume), vec!["-U", "-r", "work"]);
+        assert_eq!(flat(AttachKind::Share), vec!["-U", "-x", "work"]);
+        // 接管是 `-d -r` 两个独立参数；绝不能出现 `-D`。
+        assert_eq!(flat(AttachKind::Takeover), vec!["-U", "-d", "-r", "work"]);
+        for kind in [AttachKind::Resume, AttachKind::Share, AttachKind::Takeover] {
+            assert!(
+                !flat(kind).iter().any(|a| a.contains("-D")),
+                "no -D allowed"
+            );
+        }
+    }
+
+    /// 替身 attach：把收到的参数与 $STY 写进文件，按需返回退出码。
+    /// `.status()` 继承 stdio，所以断言走文件而不是 stdout。
+    #[test]
+    fn attach_with_propagates_exit_code() {
+        let tmp = std::env::temp_dir().join(format!("stui-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let record = tmp.join("record.txt");
+        let record_path = record.display().to_string();
+        let script = fake_screen(
+            &tmp,
+            &format!("echo \"$@\" > {record_path}; echo \"STY=$STY\" >> {record_path}; exit 7"),
+        );
+
+        let run = attach_with(&script, AttachKind::Takeover, "12345.work").unwrap();
+        // 退出码任意 → 原样带回（1.5d 替身契约：退出码不会吞掉，TUI 必能据实报告）。
+        assert_eq!(run.code, 7);
+        assert!(!run.success());
+
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        assert!(recorded.contains("-U -d -r 12345.work"), "{recorded}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `env_remove("STY")` 的行为验证：父进程设 STY，子进程必须看不到。
+    /// 环境变量是进程全局的，用互斥锁隔离（其余测试不读 STY）。
+    #[test]
+    fn attach_with_strips_sty_from_child_env() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let tmp = std::env::temp_dir().join(format!("stui-attach-sty-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let record = tmp.join("record.txt");
+        let record_path = record.display().to_string();
+        let script = fake_screen(&tmp, &format!("echo \"STY=$STY\" > {record_path}; exit 0"));
+
+        // 2024 edition 起 set_var/remove_var 标记为 unsafe（进程全局状态）；
+        // 互斥锁已保证唯一访问者，此处安全性由 ENV_LOCK 承担。
+        unsafe { std::env::set_var("STY", "12345.tty1.marker") };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            attach_with(&script, AttachKind::Resume, "work").unwrap()
+        }));
+        unsafe { std::env::remove_var("STY") };
+        drop(lock);
+
+        result.expect("attach_with should not panic");
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(recorded.trim(), "STY=", "STY must be stripped: {recorded}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

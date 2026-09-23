@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
 use crate::screen::caps::Caps;
-use crate::screen::cmd;
-use crate::screen::parse::{self, Enumeration, SessionRecord};
+use crate::screen::cmd::{self, AttachKind};
+use crate::screen::parse::{self, Enumeration, SessionRecord, Status};
 use crate::ui;
 use crate::util::time::local_label;
 
@@ -34,6 +34,8 @@ pub enum Mode {
     Detail,
     /// `n` 新建会话三步向导（FR-02）。
     NewSession,
+    /// attached 会话的冲突选择框（共享 / 接管 / 取消，FR-03）。
+    AttachChoice,
 }
 
 /// 向导步骤：名 → 目录 → 命令，每步回车即接受默认值（FR-02 验收 1）。
@@ -137,6 +139,39 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// detach 提示（1.5c）：连接前打印，M1 假定默认前缀并注明可自定义
+/// （真实 `.screenrc` 前缀探测属 FR-18 / M2）。
+pub fn detach_hint() -> &'static str {
+    "Tip: detach with Ctrl-A D (default prefix - use your own prefix + d if you changed it)"
+}
+
+/// attached 冲突选择框的挂起状态（1.5b）。
+#[derive(Debug, Clone)]
+pub struct AttachChoice {
+    pub name: String,
+    /// Multi 会话的尺寸风险提示（FR-03）。
+    pub note: Option<String>,
+}
+
+/// 已确认的连接请求：由 `App` 产出，事件循环消费（保持 App 可脱离终端单测）。
+#[derive(Debug, Clone)]
+pub struct AttachRequest {
+    pub kind: AttachKind,
+    pub target: String,
+}
+
+/// 歧义名回退（1.5e / FR-03 验收 4）：同名会话多于一个时用 `<pid>.<name>` 全名寻址。
+pub fn unambiguous_target(sessions: &[SessionRecord], name: &str) -> String {
+    let matches: Vec<&SessionRecord> = sessions.iter().filter(|s| s.name == name).collect();
+    match matches.len() {
+        1 => name.to_string(),
+        _ => matches
+            .first()
+            .map(|s| s.full.clone())
+            .unwrap_or_else(|| name.to_string()),
+    }
+}
+
 pub struct App {
     pub caps: Caps,
     pub mode: Mode,
@@ -148,6 +183,10 @@ pub struct App {
     pub status: Option<String>,
     /// 新建向导草稿；仅在 `Mode::NewSession` 期间非空。
     pub draft: Option<NewDraft>,
+    /// attached 冲突选择框状态；仅在 `Mode::AttachChoice` 期间非空。
+    pub attach: Option<AttachChoice>,
+    /// 待事件循环消费的连接请求（`take_attach_request` 取走后执行前台连接）。
+    attach_request: Option<AttachRequest>,
     pub should_quit: bool,
     pub refresh_interval: Duration,
     last_refresh: Option<Instant>,
@@ -162,6 +201,8 @@ impl App {
             selected: 0,
             status: None,
             draft: None,
+            attach: None,
+            attach_request: None,
             should_quit: false,
             refresh_interval: REFRESH_INTERVAL,
             last_refresh: None,
@@ -245,6 +286,7 @@ impl App {
             Mode::List => self.on_key_list(key.code),
             Mode::Help | Mode::Detail => self.on_key_overlay(key.code),
             Mode::NewSession => self.on_key_new(key.code),
+            Mode::AttachChoice => self.on_key_attach_choice(key.code),
         }
     }
 
@@ -268,9 +310,134 @@ impl App {
                 self.status = Some("session wipe is not implemented yet (planned for M2)".into());
             }
             KeyCode::Char('n') => self.open_new_session(),
-            // 连接（Enter / 数字键）在 T1.5 接线。
+            // 连接选中会话：连接前重校验（1.5a / NFR-08），不以列表旧状态为准。
+            KeyCode::Enter => self.start_connect(),
             _ => {}
         }
+    }
+
+    // ------------------------------------------------------------- 连接闭环（T1.5）
+
+    /// 连接入口：重新 `-ls` 拿新鲜状态再决策（FR-03 验收 3：列表不可信，必须重验）。
+    fn start_connect(&mut self) {
+        if self.sessions().is_empty() {
+            return;
+        }
+        match parse::enumerate() {
+            Ok(fresh) => self.plan_connect(fresh),
+            Err(err) => {
+                self.status = Some(format!("cannot verify sessions before connecting: {err}"));
+            }
+        }
+    }
+
+    /// 连接决策（纯逻辑，吃注入的新鲜枚举结果）。
+    pub fn plan_connect(&mut self, fresh: Enumeration) {
+        let Some(name) = self.sessions().get(self.selected).map(|s| s.name.clone()) else {
+            return;
+        };
+        // 先取走需要的信息再消费 fresh，避免借用冲突。
+        let fresh_status = fresh
+            .list
+            .sessions
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.status.clone());
+
+        match fresh_status {
+            None => {
+                // 会话已消失：明确提示 + 刷新，不卡死（FR-03 验收 3）。
+                self.status = Some(format!("session '{name}' is gone; list refreshed"));
+                self.apply_enumeration(fresh);
+            }
+            Some(status) => {
+                self.apply_enumeration(fresh);
+                match status {
+                    Status::Detached => self.request_attach(AttachKind::Resume, name),
+                    Status::Attached => {
+                        self.attach = Some(AttachChoice { name, note: None });
+                        self.mode = Mode::AttachChoice;
+                    }
+                    Status::Multi => {
+                        self.attach = Some(AttachChoice {
+                            name,
+                            note: Some(
+                                "multi-display session: terminals may resize each other".into(),
+                            ),
+                        });
+                        self.mode = Mode::AttachChoice;
+                    }
+                    // dead / unreachable 拒连（FR-03 表）。
+                    Status::Dead => {
+                        self.status = Some(format!(
+                            "'{name}' is dead; wipe it before connecting (wipe lands in M2)"
+                        ));
+                    }
+                    Status::Unreachable => {
+                        self.status =
+                            Some(format!("'{name}' is unreachable; check the socket dir"));
+                    }
+                    Status::Unknown(raw) => {
+                        self.status = Some(format!(
+                            "'{name}' reports unknown state '{raw}'; refusing to connect"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_key_attach_choice(&mut self, code: KeyCode) {
+        let Some(choice) = self.attach.take() else {
+            self.mode = Mode::List;
+            return;
+        };
+        match code {
+            // 1 共享 / 2 接管（-d -r，绝不用 -D -r）/ Esc 取消（1.5b）。
+            KeyCode::Char('1') => {
+                self.mode = Mode::List;
+                self.request_attach(AttachKind::Share, choice.name);
+            }
+            KeyCode::Char('2') => {
+                self.mode = Mode::List;
+                self.request_attach(AttachKind::Takeover, choice.name);
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.mode = Mode::List;
+            }
+            _ => {
+                // 其它按键不消费选择框状态。
+                self.attach = Some(choice);
+            }
+        }
+    }
+
+    /// 产出连接请求（歧义名在此时解析为 full name）。
+    fn request_attach(&mut self, kind: AttachKind, name: String) {
+        let sessions: Vec<SessionRecord> = self.sessions().to_vec();
+        let target = unambiguous_target(&sessions, &name);
+        self.attach_request = Some(AttachRequest { kind, target });
+    }
+
+    /// 事件循环取走连接请求；`None` 表示无待执行连接。
+    pub fn take_attach_request(&mut self) -> Option<AttachRequest> {
+        self.attach_request.take()
+    }
+
+    /// 连接结果落账（FR-03 验收 2：无论子进程退出码如何，都回到列表，不退出 TUI）。
+    pub fn note_attach_outcome(&mut self, request: &AttachRequest, run: &crate::screen::cmd::Run) {
+        self.mode = Mode::List;
+        // 先刷新再落账：refresh() 成功时会清掉瞬态消息，结果消息必须留在最后。
+        self.refresh();
+        self.status = Some(if run.success() {
+            format!("detached from '{}'", request.target)
+        } else {
+            format!(
+                "screen exited with code {} ({})",
+                run.code,
+                request.kind.label()
+            )
+        });
     }
 
     fn on_key_overlay(&mut self, code: KeyCode) {
@@ -471,7 +638,7 @@ pub fn run() -> u8 {
 
     ui::install_hooks();
 
-    let guard = match ui::TuiGuard::enter() {
+    let mut guard = match ui::TuiGuard::enter() {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("stui: cannot take over the terminal: {err}");
@@ -488,9 +655,15 @@ pub fn run() -> u8 {
     };
 
     let mut app = App::new(caps);
+    // $STY 非空 = 已经在一个 screen 会话里（FR-03 验收 5）：警告一次，不阻塞。
+    if std::env::var("STY").map(|v| !v.is_empty()).unwrap_or(false) {
+        app.status = Some(
+            "already inside a screen session ($STY); nested connections can be confusing".into(),
+        );
+    }
     app.refresh();
 
-    let outcome = event_loop(&mut terminal, &mut app);
+    let outcome = event_loop(&mut terminal, &mut guard, &mut app);
 
     // 显式 drop 顺序：先终端后守护，避免后端在已还原的终端上再写一笔。
     drop(terminal);
@@ -505,7 +678,11 @@ pub fn run() -> u8 {
     }
 }
 
-fn event_loop(terminal: &mut ui::TuiTerminal, app: &mut App) -> std::io::Result<()> {
+fn event_loop(
+    terminal: &mut ui::TuiTerminal,
+    guard: &mut ui::TuiGuard,
+    app: &mut App,
+) -> std::io::Result<()> {
     while !app.should_quit {
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -528,8 +705,45 @@ fn event_loop(terminal: &mut ui::TuiTerminal, app: &mut App) -> std::io::Result<
         if app.tick_due() {
             app.refresh();
         }
+
+        // 连接请求：suspend → 前台 screen → resume → 强制重绘（1.5d）。
+        if let Some(request) = app.take_attach_request() {
+            match attach_foreground(terminal, guard, &request) {
+                Ok(run) => app.note_attach_outcome(&request, &run),
+                Err(err) => {
+                    app.mode = Mode::List;
+                    app.status = Some(format!("attach failed: {err}"));
+                }
+            }
+            // 子进程画过屏幕：清掉 ratatui 的 diff 基线，强制整屏重绘。
+            terminal.clear()?;
+        }
     }
     Ok(())
+}
+
+/// 前台执行连接（1.5d）：spawn 而非 exec —— exec 会替换进程，detach 后无法回到 TUI。
+fn attach_foreground(
+    terminal: &mut ui::TuiTerminal,
+    guard: &mut ui::TuiGuard,
+    request: &AttachRequest,
+) -> crate::screen::Result<crate::screen::cmd::Run> {
+    use std::io::Write;
+
+    // 离开备用屏前把缓冲刷掉，然后还原终端给 screen。
+    terminal.flush()?;
+    guard.suspend()?;
+
+    // 1.5c：detach 提示打印到真实终端（留在滚动缓冲里，不进 TUI 画面）。
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "{}", detach_hint());
+    let _ = stdout.flush();
+
+    let run = cmd::attach(request.kind, &request.target);
+
+    // 子进程退出（无论退出码是什么）→ 恢复 TUI（FR-03 验收 2 头号契约）。
+    guard.resume()?;
+    run
 }
 
 #[cfg(test)]
@@ -807,5 +1021,214 @@ mod tests {
                 .unwrap_or_default()
                 .contains("not a directory")
         );
+    }
+
+    // ------------------------------------------------------------- T1.5 连接闭环
+
+    #[test]
+    fn connect_is_refused_when_session_is_gone() {
+        let mut app = app_with(FOUR);
+        app.selected = 0; // dep（解析后按名称排序）
+        // 新鲜枚举里 dep 已不存在。
+        let fresh = enumeration(
+            "There is a screen on:\n\t99999.other\t(09/23/2026 11:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
+        );
+        app.plan_connect(fresh);
+
+        assert!(app.take_attach_request().is_none(), "must not attach");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("'dep' is gone"),
+            "{}",
+            app.status.as_deref().unwrap_or_default()
+        );
+        // 列表已被刷新（只剩 1 条）。
+        assert_eq!(app.sessions().len(), 1);
+    }
+
+    #[test]
+    fn detached_session_connects_directly() {
+        let mut app = app_with(FOUR);
+        app.selected = 0; // dep (Detached)
+        app.plan_connect(enumeration(FOUR));
+
+        let request = app.take_attach_request().expect("attach request produced");
+        assert_eq!(request.kind, AttachKind::Resume);
+        assert_eq!(request.target, "dep");
+        // 取走后不重复。
+        assert!(app.take_attach_request().is_none());
+    }
+
+    #[test]
+    fn attached_session_opens_the_conflict_choice() {
+        let mut app = app_with(FOUR);
+        app.selected = 2; // llm (Attached)
+        app.plan_connect(enumeration(FOUR));
+
+        assert_eq!(app.mode, Mode::AttachChoice);
+        assert!(
+            app.take_attach_request().is_none(),
+            "waiting for user choice"
+        );
+        assert_eq!(app.attach.as_ref().unwrap().name, "llm");
+
+        // 2 → 接管（-d -r）。
+        app.on_key(key(KeyCode::Char('2')));
+        let request = app.take_attach_request().unwrap();
+        assert_eq!(request.kind, AttachKind::Takeover);
+        assert_eq!(app.mode, Mode::List);
+    }
+
+    #[test]
+    fn conflict_choice_sharing_and_cancelling() {
+        let mut app = app_with(FOUR);
+        app.selected = 2; // llm (Attached)
+        app.plan_connect(enumeration(FOUR));
+
+        // 1 → 共享。
+        app.on_key(key(KeyCode::Char('1')));
+        let request = app.take_attach_request().unwrap();
+        assert_eq!(request.kind, AttachKind::Share);
+
+        // Esc → 取消，无请求。
+        app.selected = 1;
+        app.plan_connect(enumeration(FOUR));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.take_attach_request().is_none());
+        assert_eq!(app.mode, Mode::List);
+    }
+
+    #[test]
+    fn multi_session_choice_carries_a_size_warning() {
+        let text = "There are screens on:\n\t12345.share\t(09/23/2026 10:00:00 AM)\t(Multi)\n1 Socket in /tmp/.screen.\n";
+        let mut app = app_with(text);
+        app.plan_connect(enumeration(text));
+
+        assert_eq!(app.mode, Mode::AttachChoice);
+        let note = app
+            .attach
+            .as_ref()
+            .unwrap()
+            .note
+            .as_deref()
+            .expect("size note");
+        assert!(note.contains("resize"), "{note}");
+    }
+
+    #[test]
+    fn dead_and_unknown_sessions_are_refused() {
+        let mut app = app_with(FOUR);
+        app.selected = 1; // legacy (Dead)
+        app.plan_connect(enumeration(FOUR));
+        assert!(app.take_attach_request().is_none(), "dead must be refused");
+        assert!(app.status.as_deref().unwrap_or_default().contains("dead"));
+
+        // 未知状态同样拒连（C-5：不猜）。
+        let text = "There is a screen on:\n\t12345.weird\t(09/23/2026 10:00:00 AM)\t(???)\n1 Socket in /tmp/.screen.\n";
+        let mut app = app_with(text);
+        app.plan_connect(enumeration(text));
+        assert!(app.take_attach_request().is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unknown state")
+        );
+    }
+
+    #[test]
+    fn ambiguous_names_fall_back_to_full_address() {
+        let text = "There are screens on:\n\t111.dup\t(09/23/2026 10:00:00 AM)\t(Detached)\n\t222.dup\t(09/23/2026 10:01:00 AM)\t(Detached)\n2 Sockets in /tmp/.screen.\n";
+        let sessions: Vec<SessionRecord> = parse::parse_list_output(text).unwrap().sessions;
+
+        // 同名两个 → 回退到首个匹配的 full（111.dup）。
+        let target = unambiguous_target(&sessions, "dup");
+        assert_eq!(target, "111.dup", "{target}");
+    }
+
+    #[test]
+    fn attach_outcome_always_returns_to_the_list() {
+        let mut app = app_with(FOUR);
+        app.mode = Mode::AttachChoice;
+
+        let request = AttachRequest {
+            kind: AttachKind::Resume,
+            target: "work".into(),
+        };
+
+        // 成功。
+        let ok_run = crate::screen::cmd::Run {
+            command: "screen -U -r work".into(),
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        app.note_attach_outcome(&request, &ok_run);
+        assert_eq!(app.mode, Mode::List);
+        assert!(!app.should_quit);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("detached")
+        );
+
+        // 非零退出码：回列表并如实报告，绝不吞掉（1.5d 替身契约）。
+        let fail_run = crate::screen::cmd::Run {
+            command: "screen -U -r work".into(),
+            code: 7,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        app.note_attach_outcome(&request, &fail_run);
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.status.as_deref().unwrap_or_default().contains("7"));
+    }
+
+    #[test]
+    fn detach_hint_mentions_default_prefix_and_customization() {
+        let hint = detach_hint();
+        assert!(hint.contains("Ctrl-A D"), "{hint}");
+        assert!(hint.contains("your own prefix"), "{hint}");
+    }
+
+    /// M1 出口自查：40 列目标尺寸下「看 → 选 → 进 → 出」纯键盘全流程 +
+    /// FR-03 返回契约（子进程退出必回列表，q 才退出）。
+    /// 渲染层的 40 列覆盖见 ui::list / ui::layout 的 TestBackend 断言。
+    #[test]
+    fn m1_exit_criterion_full_walk() {
+        let mut app = app_with(FOUR); // 排序后：dep / legacy / llm / work
+
+        // 看 → 选：j/k 移到 attached 的 llm。
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.sessions()[app.selected].name, "llm");
+
+        // 进：Enter 的重校验（替身注入新鲜枚举）→ attached → 选择框 → 2 接管。
+        app.plan_connect(enumeration(FOUR));
+        assert_eq!(app.mode, Mode::AttachChoice);
+        app.on_key(key(KeyCode::Char('2')));
+        let request = app.take_attach_request().expect("attach request");
+        assert_eq!(request.kind, AttachKind::Takeover);
+        assert_eq!(request.target, "llm");
+
+        // 出：子进程退出（任意退出码）→ 必回列表，TUI 不退出（FR-03 验收 2）。
+        app.note_attach_outcome(
+            &request,
+            &crate::screen::cmd::Run {
+                command: "screen -U -d -r llm".into(),
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(app.mode, Mode::List);
+        assert!(!app.should_quit);
+
+        // 唯有 q 退出。
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
     }
 }

@@ -147,7 +147,57 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
                 new::render_overlay(f, draft);
             }
         }
+        Mode::AttachChoice => {
+            render_list_screen(f, app);
+            if let Some(choice) = &app.attach {
+                render_attach_choice(f, choice);
+            }
+        }
     }
+}
+
+/// attached 冲突选择框（1.5b）：1 共享 / 2 接管 / Esc 取消。
+fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(" '{}' is attached", choice.name),
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " 1 ",
+                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::raw("share (-x)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " 2 ",
+                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::raw("takeover (-d -r)"),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(note) = &choice.note {
+        lines.push(Line::from(Span::styled(
+            note.clone(),
+            Style::default().fg(ratatui::style::Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " 1/2 choose · Esc cancel".to_string(),
+        theme::dimmed(),
+    )));
+
+    let height = lines.len() as u16 + 2;
+    let area = centered_rect(f.area(), 44, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Attached ")),
+        area,
+    );
 }
 
 /// 主列表屏：页眉 1 行 / 正文（档位驱动）/ 页脚（档位决定行数）。
