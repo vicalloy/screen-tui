@@ -19,7 +19,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::{App, Mode};
+use crate::ui::layout::Tier;
 
+pub mod detail;
+pub mod layout;
 pub mod list;
 pub mod theme;
 
@@ -136,21 +139,104 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
     match app.mode {
         Mode::List => render_list_screen(f, app),
         Mode::Help => render_help_overlay(f, app),
+        Mode::Detail => render_detail_overlay(f, app),
     }
 }
 
-/// 主列表屏：页眉 1 行 / 正文 / 页脚 1 行。
+/// 主列表屏：页眉 1 行 / 正文（档位驱动）/ 页脚（档位决定行数）。
 fn render_list_screen(f: &mut Frame<'_>, app: &App) {
+    let screen = f.area();
+    // 档位只按整屏尺寸算一次，正文/页脚共用 —— body 少 2–3 行不能拿来判 Tiny。
+    let tier = Tier::from_size(screen.width, screen.height);
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(tier.footer_rows()),
     ])
-    .areas(f.area());
+    .areas(screen);
 
     f.render_widget(header_widget(app), header);
-    list::render(f, app, body);
-    f.render_widget(footer_widget(app), footer);
+
+    match tier {
+        // 宽屏：左列表 + 右详情（常驻，随选中更新）。
+        Tier::Wide => {
+            let [left, right] =
+                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .areas(body);
+            list::render(f, app, left, tier);
+            detail::render_panel(f, app, right);
+        }
+        // 中屏：单栏列表 + 底部详情区（跟随选中）。
+        Tier::Mid => {
+            let [list_area, detail_area] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(body);
+            list::render(f, app, list_area, tier);
+            detail::render_panel(f, app, detail_area);
+        }
+        // 窄屏 / 极小屏：单栏列表；详情按 `i` 弹层。
+        Tier::Narrow | Tier::Tiny => list::render(f, app, body, tier),
+    }
+
+    render_footer(f, app, tier, footer);
+}
+
+/// 页脚：有瞬态消息时优先显示（刷新失败 / 动作结果），否则按档位给按键提示。
+fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout::Rect) {
+    if let Some(status) = &app.status {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                status.clone(),
+                Style::default().fg(ratatui::style::Color::Red),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let has_dead = app
+        .sessions()
+        .iter()
+        .any(|s| matches!(s.status, crate::screen::parse::Status::Dead));
+
+    let rows: Vec<Line<'static>> = match tier {
+        // 宽屏：2 行完整快捷键（FR-04）。
+        Tier::Wide => {
+            let mut first = vec![Span::styled(
+                " j/k move  i detail  R refresh  ? help  q quit".to_string(),
+                theme::dimmed(),
+            )];
+            if has_dead {
+                // `W` 在 M1 只给「未实现」回执，T2.4 落地（FR-01 验收 2）。
+                first.push(Span::styled("  W wipe dead", theme::dimmed()));
+            }
+            let mut second = vec![Span::styled(
+                format!(" refresh every {}s", app.refresh_interval.as_secs()),
+                theme::dimmed(),
+            )];
+            if let Some(dir) = app.socket_dir() {
+                second.push(Span::styled(format!(" · socket {dir}"), theme::dimmed()));
+            }
+            vec![Line::from(first), Line::from(second)]
+        }
+        // 中屏 / 窄屏：1 行精简。
+        Tier::Mid | Tier::Narrow => {
+            let mut spans = vec![Span::styled(
+                " j/k move  i detail  ? help  q quit".to_string(),
+                theme::dimmed(),
+            )];
+            if has_dead && tier == Tier::Mid {
+                spans.push(Span::styled("  W wipe", theme::dimmed()));
+            }
+            vec![Line::from(spans)]
+        }
+        // 极小屏：只留退出与帮助入口（帮助折叠为 ? 弹层，FR-04/05）。
+        Tier::Tiny => vec![Line::from(vec![Span::styled(
+            " ? help  q quit".to_string(),
+            theme::dimmed(),
+        )])],
+    };
+
+    f.render_widget(Paragraph::new(rows), area);
 }
 
 /// 页眉：工具名 + 会话统计 + screen 版本（数据缺失就少说，不编造）。
@@ -195,39 +281,18 @@ fn header_widget(app: &App) -> Paragraph<'static> {
     Paragraph::new(Line::from(line))
 }
 
-/// 页脚：有瞬态消息时优先显示（刷新失败 / 动作结果），否则给按键提示。
-fn footer_widget(app: &App) -> Paragraph<'static> {
-    if let Some(status) = &app.status {
-        return Paragraph::new(Line::from(Span::styled(
-            status.clone(),
-            Style::default().fg(ratatui::style::Color::Red),
-        )));
-    }
-
-    let mut spans = vec![Span::styled(
-        " q quit  ? help  R refresh".to_string(),
-        theme::dimmed(),
-    )];
-    // dead 会话存在时提示清理入口（FR-01 验收 2）；`W` 在 M1 只给「未实现」回执，T2.4 落地。
-    if app
-        .sessions()
-        .iter()
-        .any(|s| matches!(s.status, crate::screen::parse::Status::Dead))
-    {
-        spans.push(Span::styled("  W wipe dead", theme::dimmed()));
-    }
-    Paragraph::new(Line::from(spans))
-}
-
 /// `?` 帮助弹层：居中模态，`Esc` / `q` / `?` 关闭。
 fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
     // 先画底层列表，再叠弹层 —— 视觉上有上下文。
     render_list_screen(f, app);
 
     let area = centered_rect(f.area(), 46, 9);
-    let text = Line::from(vec![help_key("j/k / ↑/↓"), help_desc(" move selection")]);
     let lines = vec![
-        text,
+        Line::from(vec![help_key("j/k / ↑/↓"), help_desc(" move selection")]),
+        Line::from(vec![
+            help_key("i"),
+            help_desc("        detail of selection"),
+        ]),
         Line::from(vec![help_key("R"), help_desc("        refresh now")]),
         Line::from(vec![help_key("?"), help_desc("        this help")]),
         Line::from(vec![help_key("q / Esc"), help_desc("  quit / close")]),
@@ -246,6 +311,31 @@ fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Help ")),
+        area,
+    );
+}
+
+/// `i` 详情弹层（窄屏的主要信息入口，FR-05 验收 2）。
+fn render_detail_overlay(f: &mut Frame<'_>, app: &App) {
+    render_list_screen(f, app);
+
+    let Some(session) = app.sessions().get(app.selected) else {
+        return; // 无会话时列表层已给空态，弹层不画。
+    };
+    let lines = detail::detail_lines(session);
+    let height = lines.len() as u16 + 2; // + 边框
+    // 用显示宽度算盒宽：CJK 名字 chars().count() 会低估列数导致折行（NFR-06）。
+    let width = lines
+        .iter()
+        .map(|l| crate::util::width::display_width(l) as u16)
+        .max()
+        .unwrap_or(20)
+        + 2;
+    let area = centered_rect(f.area(), width, height);
+    let text: Vec<Line<'static>> = lines.into_iter().map(Line::from).collect();
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text).block(Block::bordered().title(" Detail ")),
         area,
     );
 }
@@ -362,5 +452,110 @@ mod tests {
         assert!(all.contains("move selection"));
         // 底层列表仍然可见（弹层居中，四周留白露出列表）。
         assert!(all.contains("stui"));
+    }
+
+    /// 8 条会话的 `-ls` 输出（FR-05 验收 1 用：40×20 首屏 ≥5 条）。
+    fn eight_sessions() -> Enumeration {
+        let mut text = String::from("There are screens on:\n");
+        for i in 0..8 {
+            text.push_str(&format!(
+                "\t{pid}.sess{i}\t(09/23/2026 10:0{i}:00 AM)\t(Detached)\n",
+                pid = 10000 + i
+            ));
+        }
+        text.push_str("8 Sockets in /tmp/.screen.\n");
+        Enumeration {
+            outlook: Outlook::Available(8),
+            list: parse::parse_list_output(&text).unwrap(),
+            list_error: None,
+        }
+    }
+
+    #[test]
+    fn tiny_screen_shows_at_least_five_sessions_on_first_screen() {
+        // FR-05 验收 1：40×20 极端尺寸下首屏 ≥5 条会话（页眉页脚之外全是行）。
+        let mut app = App::new(Caps::default());
+        app.apply_enumeration(eight_sessions());
+        let terminal = draw(&app, 40, 20);
+
+        for idx in 0..5 {
+            let line = line_at(&terminal, 1 + idx as u16); // 第 0 行是页眉
+            assert!(
+                line.contains(&format!("sess{idx}")),
+                "row {idx} must be visible at 40x20: {line:?}"
+            );
+        }
+        // 甚至 8 条全部可见。
+        let line = line_at(&terminal, 8);
+        assert!(line.contains("sess7"), "all 8 fit at 40x20");
+    }
+
+    #[test]
+    fn wide_layout_has_permanent_detail_panel() {
+        let app = app_with_fixture();
+        let terminal = draw(&app, 120, 30);
+        let all: String = (0..30u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(
+            all.contains(" Detail "),
+            "wide shows permanent detail panel"
+        );
+        // 详情面板跟随选中项：默认选中第一条。
+        let first = &app.sessions()[0];
+        assert!(all.contains(&first.name));
+    }
+
+    #[test]
+    fn mid_layout_shows_detail_below_list() {
+        let app = app_with_fixture();
+        let terminal = draw(&app, 80, 20);
+        let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(all.contains(" Detail "), "mid shows detail area");
+        assert!(all.contains("j/k move"), "mid footer is one line of hints");
+    }
+
+    #[test]
+    fn narrow_layout_has_no_permanent_detail() {
+        let app = app_with_fixture();
+        let terminal = draw(&app, 40, 20);
+        let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(
+            !all.contains(" Detail "),
+            "narrow has no permanent detail panel"
+        );
+        assert!(all.contains("? help"), "narrow footer points at help");
+    }
+
+    #[test]
+    fn detail_overlay_opens_with_i_and_follows_selection() {
+        let mut app = app_with_fixture();
+        app.selected = 2;
+        app.mode = Mode::Detail;
+        let terminal = draw(&app, 40, 20);
+        let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(all.contains(" Detail "), "overlay title present");
+        let selected = &app.sessions()[2];
+        assert!(all.contains(&selected.name), "overlay follows selection");
+        // 弹层含 pid 行（该 fixture 全部有 pid）。
+        assert!(all.contains("pid"));
+    }
+
+    #[test]
+    fn resize_changes_layout_tier_on_next_draw() {
+        let app = app_with_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        assert!(
+            (0..30u16)
+                .map(|y| line_at(&terminal, y))
+                .collect::<String>()
+                .contains(" Detail "),
+            "wide has detail panel"
+        );
+
+        // 缩到手机宽度：下一次 draw 自动重排，详情面板消失（FR-04 验收 1）。
+        terminal.backend_mut().resize(40, 20);
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(!all.contains(" Detail "), "narrow drops the panel: {all:?}");
     }
 }

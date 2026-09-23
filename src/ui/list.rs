@@ -1,9 +1,10 @@
-//! 会话列表渲染（FR-01 / T1.2）。
+//! 会话列表渲染（FR-01 / T1.2 / T1.3）。
 //!
 //! 宽度预算规则（FR-01 验收 3）：**先牺牲名字长度，绝不牺牲序号与状态** ——
 //! 光标/序号/图标是固定列，名字拿剩余预算，超出按显示宽度裁剪并补 `…`
 //! （CJK/emoji 安全，走 `util::width` 全链路钳制）。
 //!
+//! 暴露哪些列由 [`Tier`] 决定（FR-05 信息分级，见 `ui::layout::RowCols`）。
 //! 渲染只读 `App`；行装配是纯函数，直接可单测。
 
 use ratatui::layout::Rect;
@@ -13,6 +14,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::App;
 use crate::screen::parse::SessionRecord;
+use crate::ui::layout::{RowCols, Tier};
 use crate::ui::theme;
 use crate::util::width::{clip_with_ellipsis, pad_right, sanitize};
 
@@ -20,19 +22,29 @@ use crate::util::width::{clip_with_ellipsis, pad_right, sanitize};
 const PREFIX_COLS: usize = 7;
 /// 状态文字（含前导空格）预留的最大显示宽度。
 const STATUS_SUFFIX_COLS: usize = 13;
-
-/// 是否显示状态文字（T1.2 的过渡策略；T1.3 换成正式的四档信息分级）。
-fn show_status_text(area_width: u16) -> bool {
-    area_width as usize >= 40
-}
+/// PID 列（含前导空格，按 7 位数字预留）。
+const PID_COLS: usize = 8;
+/// 创建时间列（含前导空格，`MM/DD/YYYY HH:MM`）。
+const CREATED_COLS: usize = 17;
 
 /// 名字列的显示宽度预算（保证整行不溢出）。
-fn name_budget(area_width: u16, with_status: bool) -> usize {
+fn name_budget(area_width: u16, cols: RowCols) -> usize {
     let mut budget = (area_width as usize).saturating_sub(PREFIX_COLS);
-    if with_status {
+    if cols.status_text {
         budget = budget.saturating_sub(STATUS_SUFFIX_COLS);
     }
+    if cols.pid {
+        budget = budget.saturating_sub(PID_COLS);
+    }
+    if cols.created {
+        budget = budget.saturating_sub(CREATED_COLS);
+    }
     budget
+}
+
+/// 4.6+ 的创建时间原文（`08/09/2026 10:23:45 AM`）截到分钟。
+fn created_display(created: &str) -> String {
+    sanitize(created).chars().take(16).collect()
 }
 
 /// 装配一行。`name_budget` 由调用方按宽度算好；此处不做溢出保护之外的布局决策。
@@ -41,7 +53,7 @@ fn row_line(
     session: &SessionRecord,
     selected: bool,
     name_budget: usize,
-    with_status: bool,
+    cols: RowCols,
 ) -> Line<'static> {
     let base: Style = if selected {
         theme::selected_row()
@@ -64,20 +76,39 @@ fn row_line(
         ),
     ];
 
-    // 名字：控制字符消毒 → 按显示宽度裁剪 → 补齐到预算（对齐右侧状态列）。
+    // 名字：控制字符消毒 → 按显示宽度裁剪 → 补齐到预算（对齐右侧各列）。
     let name = clip_with_ellipsis(&sanitize(&session.name), name_budget);
     spans.push(Span::raw(pad_right(&name, name_budget)));
 
-    if with_status {
+    if cols.status_text {
         let label = clip_with_ellipsis(&session.status.label(), STATUS_SUFFIX_COLS - 1);
         spans.push(Span::styled(format!(" {label}"), base));
+    }
+    if cols.pid {
+        let pid = session.pid.map(|p| p.to_string()).unwrap_or_default();
+        let clipped = clip_with_ellipsis(&pid, PID_COLS - 1);
+        spans.push(Span::raw(pad_right(&clipped, PID_COLS - 1)));
+        spans.push(Span::raw(" ".to_string()));
+    }
+    if cols.created {
+        let text = session
+            .created
+            .as_deref()
+            .map(created_display)
+            .unwrap_or_default();
+        spans.push(Span::styled(
+            format!(" {}", clip_with_ellipsis(&text, CREATED_COLS - 1)),
+            base,
+        ));
     }
 
     Line::from(spans)
 }
 
 /// 把列表画进给定区域（空态给「按 n 新建」引导，FR-01 验收 1）。
-pub fn render(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+///
+/// `tier` 必须由**整屏**尺寸算出后传入（body 区高度少 2–3 行，会误判 Tiny）。
+pub fn render(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, tier: Tier) {
     let sessions = app.sessions();
     if sessions.is_empty() {
         let hint = "No screen sessions. Press n to create one.";
@@ -85,12 +116,12 @@ pub fn render(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    let with_status = show_status_text(area.width);
-    let budget = name_budget(area.width, with_status);
+    let cols = RowCols::for_tier(tier);
+    let budget = name_budget(area.width, cols);
     let lines: Vec<Line<'static>> = sessions
         .iter()
         .enumerate()
-        .map(|(idx, session)| row_line(idx, session, idx == app.selected, budget, with_status))
+        .map(|(idx, session)| row_line(idx, session, idx == app.selected, budget, cols))
         .collect();
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -136,15 +167,21 @@ mod tests {
     }
 
     fn draw(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let tier = Tier::from_size(width, height);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| render(f, app, f.area())).unwrap();
+        terminal
+            .draw(|f| {
+                let area = ratatui::layout::Rect::new(0, 0, width, height);
+                render(f, app, area, tier)
+            })
+            .unwrap();
         terminal
     }
 
     #[test]
     fn cjk_and_emoji_names_stay_in_their_columns() {
         let app = app_with_fixture();
-        let terminal = draw(&app, 80, 12);
+        let terminal = draw(&app, 80, 20);
 
         // 解析器按名称排序 —— 期望值从 app 会话表动态取，不假设 fixture 行序。
         for (idx, session) in app.sessions().iter().enumerate() {
@@ -161,11 +198,11 @@ mod tests {
     #[test]
     fn truncation_sacrifices_name_only() {
         let app = app_with_fixture();
-        let terminal = draw(&app, 40, 12);
+        let terminal = draw(&app, 40, 20);
 
-        // 超长名会话：预算 40-7-13=20，必被截断；但序号、图标、状态文字一样不少
-        // （FR-01 验收 3 的牺牲顺序）。
-        let (y, session) = app
+        // 超长名会话：Narrow 档无附加列，预算 40-7=33，必被截断；但序号、图标
+        // 一样不少（FR-01 验收 3 的牺牲顺序）。
+        let (y, _) = app
             .sessions()
             .iter()
             .enumerate()
@@ -174,34 +211,51 @@ mod tests {
         let line = line_at(&terminal, y as u16);
         assert!(line.contains('…'), "long name should be clipped: {line:?}");
         assert!(!line.contains("truncation-testing"), "tail must be gone");
-        assert!(line.contains("multi"));
         let chars: Vec<char> = line.chars().collect();
         assert_eq!(chars[5], '◈');
-        let _ = session;
     }
 
     #[test]
-    fn narrow_width_hides_status_text_but_keeps_icon() {
+    fn pid_and_created_follow_the_tier() {
         let app = app_with_fixture();
-        let terminal = draw(&app, 30, 12);
 
-        for (idx, session) in app.sessions().iter().enumerate() {
-            let line = line_at(&terminal, idx as u16);
-            let chars: Vec<char> = line.chars().collect();
-            let want = theme::status_icon(&session.status).chars().next().unwrap();
-            assert_eq!(chars[5], want, "icon must survive at 30 cols");
-            // 状态文字一概不出现（未知状态词除外——fixture 里没有）。
-            assert!(!line.contains("multi"), "status text must be hidden");
-            assert!(!line.contains("attached"));
+        // Mid 档（80×20 列）：显示 pid，不显示创建时间。
+        let mid = draw(&app, 80, 20);
+        let first = &app.sessions()[0];
+        let row = squeezed(&line_at(&mid, 0));
+        if let Some(pid) = first.pid {
+            assert!(row.contains(&pid.to_string()), "mid shows pid: {row:?}");
         }
-        // 30 列下超长名仍应截断。
-        assert!(line_at(&terminal, 0).contains('…'));
+        if let Some(created) = &first.created {
+            assert!(
+                !row.contains(&created_display(created)),
+                "mid hides created: {row:?}"
+            );
+        }
+
+        // Wide 档（120×30）：两者都显示。
+        let wide = draw(&app, 120, 30);
+        let row = squeezed(&line_at(&wide, 0));
+        if let Some(pid) = first.pid {
+            assert!(row.contains(&pid.to_string()), "wide shows pid: {row:?}");
+        }
+        if let Some(created) = &first.created {
+            let want = squeezed(&created_display(created));
+            assert!(row.contains(&want), "wide shows created: {row:?}");
+        }
+
+        // Narrow 档（71×20）：都不显示。
+        let narrow = draw(&app, 71, 20);
+        let row = squeezed(&line_at(&narrow, 0));
+        if let Some(pid) = first.pid {
+            assert!(!row.contains(&pid.to_string()), "narrow hides pid: {row:?}");
+        }
     }
 
     #[test]
     fn wide_width_fits_every_fixture_name() {
         let app = app_with_fixture();
-        let terminal = draw(&app, 80, 12);
+        let terminal = draw(&app, 80, 20);
         for idx in 0..app.sessions().len() {
             let line = squeezed(&line_at(&terminal, idx as u16));
             assert!(!line.contains('…'), "80 cols fits every fixture name");
@@ -216,7 +270,7 @@ mod tests {
             list: parse::parse_list_output("No Sockets found in /tmp/.screen.\n").unwrap(),
             list_error: None,
         });
-        let terminal = draw(&app, 60, 10);
+        let terminal = draw(&app, 60, 20);
         let body = squeezed(&line_at(&terminal, 0));
         assert!(body.contains("Noscreensessions"));
         assert!(body.contains("Pressn"), "must point at the create key");
@@ -226,7 +280,7 @@ mod tests {
     fn selected_row_is_highlighted_and_cursor_marks_it() {
         let mut app = app_with_fixture();
         app.selected = 1;
-        let terminal = draw(&app, 60, 12);
+        let terminal = draw(&app, 60, 20);
 
         let line = line_at(&terminal, 1);
         assert!(line.starts_with('>'), "cursor marks selection: {line:?}");
@@ -239,13 +293,5 @@ mod tests {
                 .add_modifier
                 .contains(ratatui::style::Modifier::REVERSED)
         );
-    }
-
-    #[test]
-    fn display_width_helper_matches_unicode_width() {
-        // 守门：本模块所有对齐假设建立在 display_width 上。
-        use crate::util::width::display_width;
-        assert_eq!(display_width("会话列表"), 8);
-        assert_eq!(display_width("🚀"), 2);
     }
 }

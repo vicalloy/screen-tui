@@ -24,6 +24,8 @@ pub enum Mode {
     List,
     /// `?` 帮助弹层。
     Help,
+    /// `i` 详情弹层（窄屏的主要信息入口，FR-05）。
+    Detail,
 }
 
 pub struct App {
@@ -115,6 +117,13 @@ impl App {
         self.next_tick_in() == Duration::ZERO && self.last_refresh.is_some()
     }
 
+    /// socket 目录（`-ls` 尾行提取；未枚举或解析不出时 `None`）。
+    pub fn socket_dir(&self) -> Option<&str> {
+        self.enumeration
+            .as_ref()
+            .and_then(|e| e.list.socket_dir.as_deref())
+    }
+
     /// 按键分发。循环层已过滤非 Press 事件，这里再挡一次（双保险，tech-design §2.2 要点 1）。
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
@@ -122,7 +131,7 @@ impl App {
         }
         match self.mode {
             Mode::List => self.on_key_list(key.code),
-            Mode::Help => self.on_key_help(key.code),
+            Mode::Help | Mode::Detail => self.on_key_overlay(key.code),
         }
     }
 
@@ -135,6 +144,12 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             // 手动刷新重置自动轮询计时（refresh() 内统一更新 last_refresh）。
             KeyCode::Char('R') => self.refresh(),
+            // 详情弹层：仅在有会话时可开（无会话保持列表空态）。
+            KeyCode::Char('i') => {
+                if !self.sessions().is_empty() {
+                    self.mode = Mode::Detail;
+                }
+            }
             // dead 清理（FR-01 验收 2 的提示入口）在 T2.4 落地；M1 给明确回执，不静默。
             KeyCode::Char('W') => {
                 self.status = Some("session wipe is not implemented yet (planned for M2)".into());
@@ -144,10 +159,12 @@ impl App {
         }
     }
 
-    fn on_key_help(&mut self, code: KeyCode) {
+    fn on_key_overlay(&mut self, code: KeyCode) {
         match code {
-            // 任何界面下 q / Esc 回上一层（requirements §9）。
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?') => self.mode = Mode::List,
+            // 任何界面下 q / Esc 回上一层（requirements §9）；`i` 再次按下同样关闭。
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('?') => {
+                self.mode = Mode::List;
+            }
             _ => {}
         }
     }
