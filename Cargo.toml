@@ -1,0 +1,32 @@
+[package]
+name = "screen-tui"
+version = "0.1.0"
+edition = "2024"
+description = "A TUI for managing GNU Screen sessions, optimized for phone-sized SSH terminals"
+license = "MIT"
+
+# 二进制名：stui（见 design/tech-design.md §1 / requirements.md §14）
+[[bin]]
+name = "stui"
+path = "src/main.rs"
+
+[dependencies]
+# TUI 渲染与终端控制（锁定 minor，升级走显式变更）
+ratatui = "0.29"
+crossterm = "0.28"
+# CLI：stui / stui ls / stui doctor
+clap = { version = "4", features = ["derive"] }
+# 配置与状态文件
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 错误类型定义
+thiserror = "2"
+# 显示宽度裁剪（CJK/emoji，NFR-06）
+unicode-width = "0.2"
+# 仅兜底使用（信号注册等 crossterm 未覆盖处）
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
