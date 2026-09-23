@@ -204,7 +204,13 @@ fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
 fn render_list_screen(f: &mut Frame<'_>, app: &App) {
     let screen = f.area();
     // 档位只按整屏尺寸算一次，正文/页脚共用 —— body 少 2–3 行不能拿来判 Tiny。
-    let tier = Tier::from_size(screen.width, screen.height);
+    // 阈值来自配置（T2.1 / FR-04 可配置）。
+    let tier = Tier::from_size_with(
+        screen.width,
+        screen.height,
+        app.config.ui.narrow_cols,
+        app.config.ui.wide_cols,
+    );
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),

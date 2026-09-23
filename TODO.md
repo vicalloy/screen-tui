@@ -1,4 +1,6 @@
-# TODO — M1 P0 核心闭环
+# TODO — screen-tui
+
+## M1 P0 核心闭环（已完成，实机验收待 T0.6）
 
 - 依据：`design/development-plan.md` §3、`design/requirements.md` §4.1（FR-01/02/03/04/05）、`design/tech-design.md` §2/§3.1
 - 出口 = requirements.md「整体验收」第 1、3 条：**纯键盘 40 列全流程（看 → 选 → 进 → 出）+ detach 必回列表**
@@ -88,3 +90,95 @@ T1.1 守护/骨架 ── T1.2 列表 ──┬── T1.3 布局
 4. detach（Ctrl-A D）后 TUI 是否完整恢复焦点/尺寸（1.5d 的实机部分）。
 5. `$STY` 非空嵌套场景的 screen 真实反应。
 6. 手机尺寸（40×20、50×12）下的真实 40 列走查：看 → 选 → 进 → 出。
+
+---
+
+# TODO — M2 P1 增强
+
+- 依据：`design/development-plan.md` §4、`design/requirements.md` §4.2（FR-10~24）、`design/tech-design.md` §3.3/§3.4/§3.5
+- 出口 = requirements.md §13「整体验收」4 条 + M2 出口：**危险操作均二次确认；预览降级路径可用**
+- 横切约定沿用：每任务一提交、CI 三门禁、替身注入可测、禁止 `stuff`
+- M2 开工地基：M1 全量（89 tests，fmt+clippy 绿）；`config.rs` 仅有目录解析与可写探针；`TempFile`（0600+RAII）已在
+
+---
+
+## 任务分解
+
+### T2.1 配置层（T2.6/T2.7 的地基）
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 2.1a | `Config` 结构（§8.2：`version` / `ui{layout,narrow_cols,wide_cols,refresh_ms,icons}` / `defaults{use_utf8,prefer_256color,attach_after_create,escape_prefix}` / `dirs` / `sessions`）+ `Default` | serde 往返单测；默认值即当前 M1 行为 |
+| 2.1b | 原子写：`config.json.tmp` → fsync → rename；目录 0700、文件 0600 | 单测断言权限与「无 tmp 残留」 |
+| 2.1c | 加载降级：JSON 损坏 → 备份 `.bak` → 默认值启动并提示；`version` 高于已知 → **只读** + 警告，不覆写（§8.3） | 两条路径单测 |
+| 2.1d | 接入 App：`refresh_interval` / 布局阈值 / `escape_prefix` 覆盖来自配置；`run()` 装配 | App 单测：配置值生效 |
+
+### T2.2 元数据探测 `screen::probe`
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 2.2a | `probe::session_meta(pid) -> Option<Meta{cwd, command}>`：Linux 走 `/proc/<pid>/cwd` readlink + cmdline（首个非 screen 子进程）；macOS 走 `ps -o command` + `lsof -a -d cwd -Fn` | 输出解析纯函数单测（fixture 化 ps/lsof 样本） |
+| 2.2b | 任何一步取不到 → `None`，UI 隐藏字段不猜测（C-5）；探测失败不影响列表主流程 | `None` 路径单测；详情渲染无该字段 |
+| 2.2c | 接入：宽屏/详情面板显示 cwd + command；`App` 带 meta 缓存（按 pid，随 refresh 失效） | TestBackend 断言字段出现/隐藏两态 |
+
+### T2.4 会话操作（危险操作 + FR-18）
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 2.4a | `cmd::remote_detach`（`-S <full> -X detach`）、`cmd::kill`（`-X quit`）、`cmd::rename`（`-X sessionname <new>`，复用 `validate_name`）、`cmd::wipe`（`screen -wipe`）——参数拼装纯函数 + 替身测试 | 替身断言参数精确、退出码透传 |
+| 2.4b | `Mode::Confirm(ConfirmAction)`：K/W/D 通用确认框，**默认焦点在取消**；框内显示会话名 + 探测到的运行命令（FR-13 验收 2）；`←/→/Tab` 切焦点、`Enter` 执行焦点项、`y` 显式确认、`Esc/n` 取消 | 状态机单测：初始焦点 = 取消；各键转换 |
+| 2.4c | 操作前重新枚举校验（NFR-08）：目标消失/状态不匹配 → 明确提示 + 刷新，不执行 | 替身测试：消失 → 不发命令 |
+| 2.4d | 键位接线：`D` 仅 Attached/Multi、`K` 非死会话、`r` 重命名（输入模式）、`W` dead 清理（确认后 `-wipe`） | 各键入口校验单测 |
+| 2.4e | FR-18：探测 `~/.screenrc` / `$SCREENRC` 的 `escape` 行 → 实际前缀；detach 提示按实际前缀输出，探测不到回退默认 + 注记 | 解析单测（`escape ^Aa` / `escape x x` 两形态） |
+
+### T2.5 过滤 + 数字直连 + 详情增强
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 2.5a | 数字键 `1`–`9` 直连对应序号（§6.4 核心键，M1 缺项补齐）；复用 `start_connect` 全套重校验 | 单测：数字 → 对应会话的连接请求 |
+| 2.5b | `Mode::Filter`：`/` 进入、输入即筛（name/pid/command/cwd）、`Esc` 清空、页脚显示过滤词与命中数；refresh 不重置过滤、不丢选中 | 状态机 + TestBackend 断言 |
+| 2.5c | 详情增强：`-Q windows` 可用（`caps.query == Yes`）时显示窗口数；`Unknown/No` 时**整行隐藏**（FR-17 验收）；结果按 pid 缓存，随 refresh 失效 | 替身注入 `-Q` 输出单测 |
+| 2.5d | 帮助弹层更新：n / Enter / 1-9 / x / p / i / D / K / r / W / / / R / ? / q 全量按键表 | 渲染断言 |
+
+### T2.3 预览（hardcopy 快照，FR-15）
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 2.3a | `screen::preview(full) -> Result<String>`：`TempFile`（0600+RAII）+ `screen -S <full> -X hardcopy <path>`；尾部空白裁剪、长行按宽度裁剪；每次重抓不缓存 | 替身注入 hardcopy 输出；裁剪纯函数单测 |
+| 2.3b | `Mode::Preview` 弹层：标题含会话名 + 抓取时间；`p` 打开；**失败明确显示不可用原因，绝不显示上一次内容**（FR-15 验收 3） | 三路径（成功/失败/空输出）单测 |
+| 2.3c | 宽屏右栏 Preview 常驻（Detail 下方），随选中项更新；窄屏仅 `p` 弹层 | TestBackend：宽屏有 / 窄屏无 |
+| 2.3d | 降级：`caps.hardcopy != Yes` 时 `p` 直接给「预览不可用 + 原因」；dead 会话拒绝预览 | 替身单测 |
+
+### T2.6 元数据持久化（FR-24）
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 2.6a | `create` 成功后写 `sessions{name, managed:true, command, cwd}`；连接过（attach）的会话入库为 unmanaged 记录（仅含 last_seen） | 单测：两来源记录字段正确 |
+| 2.6b | 别名/描述编辑：详情弹层 `a` 别名、`t` 描述（单行输入）；列表宽/中屏显示别名 | 状态机 + 渲染单测 |
+| 2.6c | 重启：managed 会话 dead 或消失时可 `s` 用记录的 command+cwd 重建；unmanaged 明确禁用（提示原因） | 单测：managed 重启参数正确；unmanaged 拒绝 |
+| 2.6d | 会话消失元数据**保留**；手动清理入口：列表 `C` 确认后删除已消失会话的全部元数据（GC 策略=手动，§14） | 单测：消失后仍在；清理后消失 |
+
+### T2.7 收藏目录（FR-23）
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 2.7a | `dirs{path,last_used}`：新建/连接（探测到 cwd）时自动入库；按 last_used 降序；上限可配默认 10，入满淘汰最旧 | 单测：排序、去重、上限淘汰 |
+| 2.7b | 新建向导目录步：顶部列出最近目录，`1`–`9` 直选；手输路径不受影响 | 状态机 + 渲染单测 |
+
+---
+
+## M2 依赖与顺序
+
+```
+T2.1 配置 ──┬── T2.6 元数据 ── T2.7 收藏
+            └── T2.4 会话操作 ── T2.3 预览（共用确认/重校验基建）
+T2.2 probe ── T2.5 过滤/详情
+```
+
+实现顺序：T2.1 → T2.2 → T2.4 → T2.5 → T2.3 → T2.6 → T2.7。
+
+## M2 验收边界
+
+- `-X detach/quit/sessionname`、`-wipe`、`hardcopy` 的真实语义仍受 T0.6 制约：本机只能验证「参数拼装 + 替身注入 + 降级路径」；实机走查在 T0.6 补测后统一做。
+- `kill -9` 后终端不报废的验收已随 T1.1 覆盖口径执行。
+

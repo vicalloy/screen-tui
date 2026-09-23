@@ -28,12 +28,24 @@ pub enum Tier {
 
 impl Tier {
     /// 档位判定（纯函数，供 resize 自动重排与单测使用）。
+    /// 阈值取 `ui::layout` 常量；配置化版本见 [`Tier::from_size_with`]。
     pub fn from_size(width: u16, height: u16) -> Tier {
+        Self::from_size_with(width, height, NARROW_COLS, WIDE_COLS)
+    }
+
+    /// 阈值来自配置的档位判定（T2.1 / FR-04「阈值可配置」）。
+    ///
+    /// 非法配置按边界夹紧：阈值永远不会把 ≥50 列的终端判进 Tiny 之外的方向，
+    /// `narrow ≥ wide` 的退化配置最多让 Mid 档消失，不会让判定区间交叉。
+    pub fn from_size_with(width: u16, height: u16, narrow_cols: u16, wide_cols: u16) -> Tier {
         if width < TINY_COLS || height < TINY_ROWS {
-            Tier::Tiny
-        } else if width >= WIDE_COLS {
+            return Tier::Tiny;
+        }
+        let wide = wide_cols.max(TINY_COLS);
+        let narrow = narrow_cols.clamp(TINY_COLS, wide.saturating_sub(1));
+        if width >= wide {
             Tier::Wide
-        } else if width >= NARROW_COLS {
+        } else if width >= narrow {
             Tier::Mid
         } else {
             Tier::Narrow

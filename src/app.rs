@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
+use crate::config::Config;
 use crate::screen::caps::Caps;
 use crate::screen::cmd::{self, AttachKind};
 use crate::screen::parse::{self, Enumeration, SessionRecord, Status};
@@ -174,6 +175,8 @@ pub fn unambiguous_target(sessions: &[SessionRecord], name: &str) -> String {
 
 pub struct App {
     pub caps: Caps,
+    /// 用户配置（T2.1）：刷新间隔、布局阈值、escape 前缀覆盖等。
+    pub config: Config,
     pub mode: Mode,
     /// 最近一次 `-ls` 枚举结果；首次刷新失败时为 `None`（正文给空态，不闪退）。
     pub enumeration: Option<Enumeration>,
@@ -194,8 +197,15 @@ pub struct App {
 
 impl App {
     pub fn new(caps: Caps) -> Self {
+        Self::with_config(caps, Config::default())
+    }
+
+    /// 带配置构造（T2.1）：刷新间隔来自配置（FR-19 可配置项），下限 500ms 防忙轮询。
+    pub fn with_config(caps: Caps, config: Config) -> Self {
+        let refresh_interval = Duration::from_millis(config.ui.refresh_ms.max(500));
         Self {
             caps,
+            config,
             mode: Mode::List,
             enumeration: None,
             selected: 0,
@@ -204,7 +214,7 @@ impl App {
             attach: None,
             attach_request: None,
             should_quit: false,
-            refresh_interval: REFRESH_INTERVAL,
+            refresh_interval,
             last_refresh: None,
         }
     }
@@ -628,6 +638,9 @@ pub fn run() -> u8 {
         return crate::cli::EXIT_ENV;
     }
 
+    // 配置先行（T2.1）：加载失败/损坏已在本层降级，warnings 随首帧给用户。
+    let loaded = crate::config::load();
+
     let caps = match Caps::detect(None) {
         Ok(caps) => caps,
         Err(err) => {
@@ -654,7 +667,7 @@ pub fn run() -> u8 {
         }
     };
 
-    let mut app = App::new(caps);
+    let mut app = App::with_config(caps, loaded.config);
     // $STY 非空 = 已经在一个 screen 会话里（FR-03 验收 5）：警告一次，不阻塞。
     if std::env::var("STY").map(|v| !v.is_empty()).unwrap_or(false) {
         app.status = Some(
@@ -662,6 +675,10 @@ pub fn run() -> u8 {
         );
     }
     app.refresh();
+    // 配置警告在首帧后给出（refresh 会清瞬态消息，这条必须在它之后落）。
+    if !loaded.warnings.is_empty() {
+        app.status = Some(loaded.warnings.join("; "));
+    }
 
     let outcome = event_loop(&mut terminal, &mut guard, &mut app);
 
