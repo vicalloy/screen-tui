@@ -6,6 +6,7 @@
 pub mod caps;
 pub mod cmd;
 pub mod parse;
+pub mod preview;
 pub mod probe;
 
 /// 状态类型在适配层根上再导出一份，供上层免于深路径引用。
@@ -45,6 +46,10 @@ pub enum Error {
     /// 临时文件（hardcopy 试写 / 预览）相关的 IO 错误。
     #[error("temporary file error: {0}")]
     Temp(#[from] std::io::Error),
+
+    /// 预览不可用（FR-15 验收 3）：hardcopy 失败/未写盘。绝不降级为「显示旧内容」。
+    #[error("preview unavailable: {0}")]
+    PreviewUnavailable(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

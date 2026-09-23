@@ -25,6 +25,7 @@ pub mod detail;
 pub mod layout;
 pub mod list;
 pub mod new;
+pub mod preview;
 pub mod theme;
 
 /// 信号 handler 置位的退出请求。事件循环每轮检查，走正常退出路径还原终端。
@@ -169,6 +170,7 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
             render_list_screen(f, app);
             render_filter_input(f, app);
         }
+        Mode::Preview => preview::render_overlay(f, app),
     }
 }
 
@@ -318,7 +320,7 @@ fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
 }
 
 /// 主列表屏：页眉 1 行 / 正文（档位驱动）/ 页脚（档位决定行数）。
-fn render_list_screen(f: &mut Frame<'_>, app: &App) {
+pub(crate) fn render_list_screen(f: &mut Frame<'_>, app: &App) {
     let screen = f.area();
     // 档位只按整屏尺寸算一次，正文/页脚共用 —— body 少 2–3 行不能拿来判 Tiny。
     // 阈值来自配置（T2.1 / FR-04 可配置）。
@@ -338,13 +340,17 @@ fn render_list_screen(f: &mut Frame<'_>, app: &App) {
     f.render_widget(header_widget(app), header);
 
     match tier {
-        // 宽屏：左列表 + 右详情（常驻，随选中更新）。
+        // 宽屏：左列表 + 右详情/预览（FR-15 验收 5：预览常驻右栏）。
         Tier::Wide => {
             let [left, right] =
                 Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                     .areas(body);
+            let [detail_area, preview_area] =
+                Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .areas(right);
             list::render(f, app, left, tier);
-            detail::render_panel(f, app, right);
+            detail::render_panel(f, app, detail_area);
+            preview::render_pane(f, app, preview_area);
         }
         // 中屏：单栏列表 + 底部详情区（跟随选中）。
         Tier::Mid => {

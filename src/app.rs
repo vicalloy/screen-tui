@@ -44,6 +44,8 @@ pub enum Mode {
     Rename,
     /// `/` 过滤输入（FR-16）。查询词存在 `App::filter`，离开输入态后仍生效。
     Filter,
+    /// `p` 预览快照（FR-15）。
+    Preview,
 }
 
 /// 向导步骤：名 → 目录 → 命令，每步回车即接受默认值（FR-02 验收 1）。
@@ -226,6 +228,28 @@ pub struct RenameRequest {
     pub new_name: String,
 }
 
+// ------------------------------------------------------------- 预览（T2.3）
+
+/// 一次成功抓取的预览视图（FR-15）。只在成功时存在 —— 失败不 produce 视图，
+/// 绝不用旧视图顶替（FR-15 验收 3）。
+#[derive(Debug, Clone)]
+pub struct PreviewView {
+    pub full: String,
+    pub name: String,
+    /// 抓取时间标签（本地时间）。
+    pub fetched: String,
+    pub lines: Vec<String>,
+}
+
+/// 预览抓取请求：`App` 产出、事件循环执行（保持 App 可脱离终端单测）。
+#[derive(Debug, Clone)]
+pub struct PreviewRequest {
+    pub full: String,
+    pub name: String,
+    /// `true` = 用户按了 `p`（失败要给可读提示）；`false` = 宽屏自动跟随（失败静默降级）。
+    pub manual: bool,
+}
+
 /// `.screenrc` 的 `escape` 行解析（FR-18，纯函数）。
 ///
 /// 认两种形态：`escape ^Aa`（单 token：控制字符 + 命令字符）与 `escape ^A a`
@@ -340,6 +364,12 @@ pub struct App {
     pub filter: String,
     /// 选中会话的窗口数（`-Q windows`，FR-17）。能力不可用/未知时恒为 `None` → UI 隐藏。
     pub window_count: Option<usize>,
+    /// 最近一次成功抓取的预览（T2.3）。仅宽屏右栏与 `p` 弹层消费。
+    pub preview: Option<PreviewView>,
+    /// 宽屏自动预览的「已抓取目标」—— 同一会话不重复抓，选中项变化才再抓。
+    last_preview_target: Option<String>,
+    /// 待事件循环执行的预览抓取请求。
+    preview_request: Option<PreviewRequest>,
     /// 会话枚举器（NFR-10 可测性）：生产用 [`parse::enumerate`]，
     /// 测试注入替身 —— 与 M1 的 `plan_connect` 注入风格一致，但覆盖所有调用点。
     enumerate: fn() -> crate::screen::Result<Enumeration>,
@@ -378,6 +408,9 @@ impl App {
             escape_prefix: None,
             filter: String::new(),
             window_count: None,
+            preview: None,
+            last_preview_target: None,
+            preview_request: None,
             enumerate: parse::enumerate,
             action_request: None,
             rename_request: None,
@@ -602,7 +635,7 @@ impl App {
         }
         match self.mode {
             Mode::List => self.on_key_list(key.code),
-            Mode::Help | Mode::Detail => self.on_key_overlay(key.code),
+            Mode::Help | Mode::Detail | Mode::Preview => self.on_key_overlay(key.code),
             Mode::NewSession => self.on_key_new(key.code),
             Mode::AttachChoice => self.on_key_attach_choice(key.code),
             Mode::Confirm => self.on_key_confirm(key.code),
@@ -635,6 +668,8 @@ impl App {
             KeyCode::Char('r') => self.open_rename(),
             // 显式共享连接（FR-10）：任何可连接会话都可以 `-x` 进入。
             KeyCode::Char('x') => self.start_share(),
+            // 预览快照（FR-15）。
+            KeyCode::Char('p') => self.open_preview(),
             KeyCode::Char('n') => self.open_new_session(),
             // 数字键 1–9 直连对应序号（§6.4 核心键）。
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
@@ -772,6 +807,98 @@ impl App {
                 request.kind.label()
             )
         });
+    }
+
+    // ------------------------------------------------------------- 预览（T2.3 / FR-15）
+
+    /// `p` 预览入口：能力/状态门槛在这里拦（给可读原因），抓取请求交事件循环。
+    fn open_preview(&mut self) {
+        let visible = self.sessions();
+        let Some(session) = visible.get(self.selected) else {
+            return;
+        };
+        if matches!(session.status, Status::Dead | Status::Unreachable) {
+            self.status = Some(format!(
+                "'{}' is not running; there is nothing to preview",
+                session.name
+            ));
+            return;
+        }
+        if !self.caps.hardcopy.usable() {
+            self.status = Some(format!(
+                "preview unavailable: hardcopy support is {} on this screen build \
+                 (run `stui doctor` for details)",
+                self.caps.hardcopy.label()
+            ));
+            return;
+        }
+        self.last_preview_target = Some(session.full.clone());
+        self.preview_request = Some(PreviewRequest {
+            full: session.full.clone(),
+            name: session.name.clone(),
+            manual: true,
+        });
+    }
+
+    /// 宽屏右栏（FR-15 验收 5）：预览常驻并随选中项更新 —— 选中项变化时产一次抓取请求。
+    /// 失败由事件循环静默降级（pane 显示提示，不用 status 刷屏）。
+    pub fn wide_preview_due(&mut self, is_wide: bool) -> Option<PreviewRequest> {
+        if !is_wide || self.mode != Mode::List || !self.caps.hardcopy.usable() {
+            return None;
+        }
+        if self.preview_request.is_some() {
+            return None;
+        }
+        let visible = self.sessions();
+        let session = visible.get(self.selected)?;
+        let full = session.full.clone();
+        if self.last_preview_target.as_deref() == Some(full.as_str()) {
+            return None;
+        }
+        let name = session.name.clone();
+        self.last_preview_target = Some(full.clone());
+        Some(PreviewRequest {
+            full,
+            name,
+            manual: false,
+        })
+    }
+
+    /// 事件循环取走预览请求。
+    pub fn take_preview_request(&mut self) -> Option<PreviewRequest> {
+        self.preview_request.take()
+    }
+
+    /// 抓取成功落账：视图带抓取时间；手动请求进入弹层。
+    pub fn note_preview(&mut self, request: &PreviewRequest, lines: Vec<String>) {
+        self.preview = Some(PreviewView {
+            full: request.full.clone(),
+            name: request.name.clone(),
+            fetched: crate::util::time::local_datetime(std::time::SystemTime::now()),
+            lines,
+        });
+        if request.manual {
+            self.mode = Mode::Preview;
+        }
+    }
+
+    /// 抓取失败落账：手动给 status（可读原因），自动只清视图（pane 回落提示），
+    /// 绝不让旧视图冒充新会话的画面（FR-15 验收 3）。
+    pub fn note_preview_failed(&mut self, request: &PreviewRequest, reason: String) {
+        if self
+            .preview
+            .as_ref()
+            .map(|v| v.full == request.full)
+            .unwrap_or(false)
+        {
+            self.preview = None;
+        }
+        if self.last_preview_target.as_deref() == Some(request.full.as_str()) {
+            self.last_preview_target = None;
+        }
+        if request.manual {
+            self.status = Some(reason);
+        }
     }
 
     // ------------------------------------------------------------- 会话动作（T2.4）
@@ -1319,8 +1446,33 @@ fn event_loop(
                 }
             }
         }
+
+        // 预览抓取（T2.3）：用户按 p 的手动请求。
+        if let Some(request) = app.take_preview_request() {
+            execute_preview(app, &request);
+        }
+
+        // 宽屏右栏自动预览（FR-15 验收 5）：选中项变化才抓，失败静默降级。
+        let size = terminal.size()?;
+        let is_wide = ui::layout::Tier::from_size_with(
+            size.width,
+            size.height,
+            app.config.ui.narrow_cols,
+            app.config.ui.wide_cols,
+        ) == ui::layout::Tier::Wide;
+        if let Some(request) = app.wide_preview_due(is_wide) {
+            execute_preview(app, &request);
+        }
     }
     Ok(())
+}
+
+/// 执行一次预览抓取并落账（事件循环侧；请求是否手动决定失败时的告知方式）。
+fn execute_preview(app: &mut App, request: &PreviewRequest) {
+    match crate::screen::preview::preview_with(&app.caps.program, &request.full) {
+        Ok(lines) => app.note_preview(request, lines),
+        Err(err) => app.note_preview_failed(request, err.to_string()),
+    }
 }
 
 /// 前台执行连接（1.5d）：spawn 而非 exec —— exec 会替换进程，detach 后无法回到 TUI。
@@ -2161,6 +2313,93 @@ mod tests {
         app.refresh_meta();
         assert!(app.window_count.is_none());
         assert!(!app.caps.query.usable(), "default caps must stay Unknown");
+    }
+
+    // ------------------------------------------------------------- T2.3 预览
+
+    #[test]
+    fn preview_open_guards_capabilities_and_dead() {
+        // hardcopy 能力未证实（Unknown）→ 拒绝并说明（FR-15 验收 3 的降级路径）。
+        let mut app = app_with(FOUR);
+        app.selected = 0;
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(app.take_preview_request().is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("preview unavailable")
+        );
+
+        // dead 会话拒绝预览（2.3d）。
+        let mut app = app_with(FOUR);
+        app.caps.hardcopy = crate::screen::caps::Support::Yes;
+        app.selected = 1; // legacy（dead）
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(app.take_preview_request().is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("nothing to preview")
+        );
+
+        // detached + 能力可用 → 产出手动抓取请求。
+        app.selected = 0; // dep
+        app.on_key(key(KeyCode::Char('p')));
+        let request = app.take_preview_request().expect("preview request");
+        assert!(request.manual);
+        assert_eq!(request.full, "12347.dep");
+    }
+
+    #[test]
+    fn preview_outcome_lands_as_view_or_status() {
+        let mut app = app_with(FOUR);
+        let request = PreviewRequest {
+            full: "12345.dep".into(),
+            name: "dep".into(),
+            manual: true,
+        };
+
+        // 成功：视图带抓取时间；手动请求进入弹层。
+        app.note_preview(&request, vec!["ready".into()]);
+        let view = app.preview.as_ref().expect("view stored");
+        assert_eq!(view.lines, vec!["ready"]);
+        assert!(!view.fetched.is_empty());
+        assert_eq!(app.mode, Mode::Preview);
+
+        // 失败（手动）：status 给原因，视图被清，不留陈旧内容。
+        app.note_preview_failed(&request, "preview unavailable: boom".into());
+        assert!(app.preview.is_none());
+        assert!(app.status.as_deref().unwrap_or_default().contains("boom"));
+    }
+
+    #[test]
+    fn wide_auto_preview_fetches_once_per_selection() {
+        let mut app = app_with(FOUR);
+        app.caps.hardcopy = crate::screen::caps::Support::Yes;
+        app.selected = 0;
+
+        // 非 wide 不自动抓。
+        assert!(app.wide_preview_due(false).is_none());
+
+        // wide + 选中变化 → 一次自动请求。
+        let request = app.wide_preview_due(true).expect("auto fetch");
+        assert!(!request.manual);
+        // 同一会话不重复抓。
+        assert!(app.wide_preview_due(true).is_none());
+        // 会话消失时宽屏请求自然为 None（空列表）。
+        let mut empty = App::new(Caps::default());
+        empty.caps.hardcopy = crate::screen::caps::Support::Yes;
+        assert!(empty.wide_preview_due(true).is_none());
+
+        // 自动失败：不写 status（不刷屏），只清目标让下轮重试。
+        app.note_preview_failed(&request, "boom".into());
+        assert!(app.status.is_none());
+        assert!(
+            app.wide_preview_due(true).is_some(),
+            "cleared target retries"
+        );
     }
 
     #[test]
