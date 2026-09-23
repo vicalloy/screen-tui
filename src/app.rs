@@ -38,6 +38,10 @@ pub enum Mode {
     NewSession,
     /// attached 会话的冲突选择框（共享 / 接管 / 取消，FR-03）。
     AttachChoice,
+    /// 危险操作二次确认（K / D / W，FR-13/FR-12/FR-20）。
+    Confirm,
+    /// `r` 重命名输入（FR-14）。
+    Rename,
 }
 
 /// 向导步骤：名 → 目录 → 命令，每步回车即接受默认值（FR-02 验收 1）。
@@ -141,18 +145,140 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// detach 提示（1.5c）：连接前打印，M1 假定默认前缀并注明可自定义
-/// （真实 `.screenrc` 前缀探测属 FR-18 / M2）。
-pub fn detach_hint() -> &'static str {
-    "Tip: detach with Ctrl-A D (default prefix - use your own prefix + d if you changed it)"
-}
-
 /// attached 冲突选择框的挂起状态（1.5b）。
 #[derive(Debug, Clone)]
 pub struct AttachChoice {
     pub name: String,
     /// Multi 会话的尺寸风险提示（FR-03）。
     pub note: Option<String>,
+}
+
+// ------------------------------------------------------------- 会话动作（T2.4）
+
+/// 动作种类（对应 `cmd::SessionAction`；App 层单独建模以携带展示信息）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    /// 远程断开（FR-12）。
+    Detach,
+    /// 终止会话（FR-13）。
+    Kill,
+    /// 清理 dead 会话（FR-20）。
+    Wipe,
+}
+
+impl ActionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ActionKind::Detach => "detach",
+            ActionKind::Kill => "kill",
+            ActionKind::Wipe => "wipe",
+        }
+    }
+
+    /// 确认框的动词描述（危险操作要把后果说清楚）。
+    pub fn consequence(self) -> &'static str {
+        match self {
+            ActionKind::Detach => "detach the attached client (it keeps running)",
+            ActionKind::Kill => "TERMINATE the session and all its windows",
+            ActionKind::Wipe => "remove all dead session sockets",
+        }
+    }
+
+    fn to_cmd(self) -> cmd::SessionAction {
+        match self {
+            ActionKind::Detach => cmd::SessionAction::Detach,
+            ActionKind::Kill => cmd::SessionAction::Kill,
+            ActionKind::Wipe => cmd::SessionAction::Wipe,
+        }
+    }
+}
+
+/// 二次确认框的状态（FR-13：默认焦点在**取消**，防小屏误触）。
+#[derive(Debug, Clone)]
+pub struct ConfirmAction {
+    pub kind: ActionKind,
+    /// `<pid>.<name>` 全名（Wipe 为空串）。
+    pub target: String,
+    /// 确认框里显示的会话名。
+    pub display: String,
+    /// 探测到的运行命令（FR-13 验收 2：让用户确认杀对了对象）。
+    pub command: Option<String>,
+    /// 当前焦点：`true` = 确认键。**初始恒为 false（取消）**。
+    pub focus_yes: bool,
+}
+
+/// 重命名输入的状态（FR-14）。
+#[derive(Debug, Clone)]
+pub struct RenameDraft {
+    /// `<pid>.<name>` 全名。
+    pub target: String,
+    /// 可编辑的新名字（预填当前名）。
+    pub name: String,
+    pub error: Option<String>,
+}
+
+/// 已确认的重命名请求：由 `App` 产出、事件循环消费。
+#[derive(Debug, Clone)]
+pub struct RenameRequest {
+    pub target: String,
+    pub new_name: String,
+}
+
+/// `.screenrc` 的 `escape` 行解析（FR-18，纯函数）。
+///
+/// 认两种形态：`escape ^Aa`（单 token：控制字符 + 命令字符）与 `escape ^A a`
+/// （两 token）。返回给用户看的前缀描述，如 `Ctrl-A`；字面前缀字符原样返回。
+pub fn parse_screenrc_escape(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut tokens = line.split_whitespace();
+        // 空 token（空行/纯注释行）只跳过本行，绝不能 `?` 提前退出整个函数。
+        let Some(keyword) = tokens.next() else {
+            continue;
+        };
+        if keyword != "escape" {
+            continue;
+        }
+        let Some(first) = tokens.next() else {
+            continue;
+        };
+        let first = first.trim_start_matches('"');
+        let describe = |token: &str| -> Option<String> {
+            let raw = token.strip_prefix('^').unwrap_or(token);
+            let c = raw.chars().next()?;
+            if token.starts_with('^') {
+                Some(format!("Ctrl-{}", c.to_ascii_uppercase()))
+            } else {
+                Some(c.to_string())
+            }
+        };
+        return describe(first);
+    }
+    None
+}
+
+/// 探测用户实际配置的 escape 前缀（FR-18）：`$SCREENRC` > `~/.screenrc`。
+pub fn detect_escape_prefix() -> Option<String> {
+    let path = match std::env::var_os("SCREENRC").filter(|v| !v.is_empty()) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+            std::path::PathBuf::from(home).join(".screenrc")
+        }
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_screenrc_escape(&text)
+}
+
+/// detach 提示（FR-18 验收）：探测到实际前缀时按它提示，否则回退默认并注明。
+pub fn detach_hint_text(prefix: Option<&str>) -> String {
+    match prefix {
+        Some(p) => format!("Tip: detach with {p} d"),
+        None => {
+            "Tip: detach with Ctrl-A D (default prefix - use your own prefix + d if you changed it)"
+                .into()
+        }
+    }
 }
 
 /// 已确认的连接请求：由 `App` 产出，事件循环消费（保持 App 可脱离终端单测）。
@@ -193,6 +319,16 @@ pub struct App {
     pub meta: Option<probe::Meta>,
     /// attached 冲突选择框状态；仅在 `Mode::AttachChoice` 期间非空。
     pub attach: Option<AttachChoice>,
+    /// 危险操作确认框状态；仅在 `Mode::Confirm` 期间非空。
+    pub confirm: Option<ConfirmAction>,
+    /// 重命名输入状态；仅在 `Mode::Rename` 期间非空。
+    pub rename: Option<RenameDraft>,
+    /// 探测到的 escape 前缀（FR-18）；`None` = 未探测到，提示回退默认。
+    pub escape_prefix: Option<String>,
+    /// 待事件循环消费的**动作**请求（已过确认框）。
+    action_request: Option<ConfirmAction>,
+    /// 待事件循环消费的重命名请求。
+    rename_request: Option<RenameRequest>,
     /// 待事件循环消费的连接请求（`take_attach_request` 取走后执行前台连接）。
     attach_request: Option<AttachRequest>,
     pub should_quit: bool,
@@ -219,6 +355,11 @@ impl App {
             meta_cache: probe::MetaCache::default(),
             meta: None,
             attach: None,
+            confirm: None,
+            rename: None,
+            escape_prefix: None,
+            action_request: None,
+            rename_request: None,
             attach_request: None,
             should_quit: false,
             refresh_interval,
@@ -317,6 +458,8 @@ impl App {
             Mode::Help | Mode::Detail => self.on_key_overlay(key.code),
             Mode::NewSession => self.on_key_new(key.code),
             Mode::AttachChoice => self.on_key_attach_choice(key.code),
+            Mode::Confirm => self.on_key_confirm(key.code),
+            Mode::Rename => self.on_key_rename(key.code),
         }
     }
 
@@ -335,10 +478,11 @@ impl App {
                     self.mode = Mode::Detail;
                 }
             }
-            // dead 清理（FR-01 验收 2 的提示入口）在 T2.4 落地；M1 给明确回执，不静默。
-            KeyCode::Char('W') => {
-                self.status = Some("session wipe is not implemented yet (planned for M2)".into());
-            }
+            // 危险 / 低频操作（§6.4 设计规则：大写键留给危险或低频动作）。
+            KeyCode::Char('D') => self.open_confirm(ActionKind::Detach),
+            KeyCode::Char('K') => self.open_confirm(ActionKind::Kill),
+            KeyCode::Char('W') => self.open_confirm(ActionKind::Wipe),
+            KeyCode::Char('r') => self.open_rename(),
             KeyCode::Char('n') => self.open_new_session(),
             // 连接选中会话：连接前重校验（1.5a / NFR-08），不以列表旧状态为准。
             KeyCode::Enter => self.start_connect(),
@@ -467,6 +611,222 @@ impl App {
                 run.code,
                 request.kind.label()
             )
+        });
+    }
+
+    // ------------------------------------------------------------- 会话动作（T2.4）
+
+    /// 打开危险操作确认框（FR-13）。入口即校验（NFR-08 的第一道），
+    /// 但**执行前**事件循环还会拿新鲜枚举再验一次 —— 中间只隔确认框，仍可能变化。
+    fn open_confirm(&mut self, kind: ActionKind) {
+        match kind {
+            ActionKind::Wipe => {
+                if !self.sessions().iter().any(|s| s.status == Status::Dead) {
+                    self.status = Some("no dead sessions; nothing to wipe".into());
+                    return;
+                }
+                self.confirm = Some(ConfirmAction {
+                    kind,
+                    target: String::new(),
+                    display: "dead sessions".into(),
+                    command: None,
+                    focus_yes: false, // 默认焦点在取消（FR-13 验收 1）。
+                });
+            }
+            ActionKind::Detach | ActionKind::Kill => {
+                let Some(session) = self.sessions().get(self.selected) else {
+                    return;
+                };
+                if kind == ActionKind::Detach
+                    && !matches!(session.status, Status::Attached | Status::Multi)
+                {
+                    self.status = Some(format!(
+                        "'{}' is not attached; nothing to detach (use Enter to connect)",
+                        session.name
+                    ));
+                    return;
+                }
+                self.confirm = Some(ConfirmAction {
+                    kind,
+                    target: session.full.clone(),
+                    display: session.name.clone(),
+                    command: self.meta.as_ref().and_then(|m| m.command.clone()),
+                    focus_yes: false,
+                });
+            }
+        }
+        self.mode = Mode::Confirm;
+    }
+
+    fn on_key_confirm(&mut self, code: KeyCode) {
+        let Some(mut confirm) = self.confirm.take() else {
+            self.mode = Mode::List;
+            return;
+        };
+        match code {
+            // ←/→/Tab 切焦点；Enter 执行焦点项；y 显式确认；n/Esc/q 取消。
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                confirm.focus_yes = !confirm.focus_yes;
+                self.confirm = Some(confirm);
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::List;
+                self.action_request = Some(confirm);
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::List;
+                if confirm.focus_yes {
+                    self.action_request = Some(confirm);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::List;
+            }
+            _ => {
+                self.confirm = Some(confirm);
+            }
+        }
+    }
+
+    /// 事件循环取走动作请求；`None` = 无待执行动作。
+    pub fn take_action(&mut self) -> Option<ConfirmAction> {
+        self.action_request.take()
+    }
+
+    /// 动作执行前的重校验（NFR-08）：吃注入的新鲜枚举，不合格一律拒绝并说明。
+    /// 新鲜枚举会更新到列表（与会话消失的提示保持一致，FR-03 验收 3 同款体验）。
+    pub fn validate_action(
+        &mut self,
+        fresh: Enumeration,
+        action: &ConfirmAction,
+    ) -> Result<(), String> {
+        let dead_count = fresh
+            .list
+            .sessions
+            .iter()
+            .filter(|s| s.status == Status::Dead)
+            .count();
+        let found = fresh
+            .list
+            .sessions
+            .iter()
+            .find(|s| s.full == action.target)
+            .map(|s| s.status.clone());
+        self.apply_enumeration(fresh);
+
+        match action.kind {
+            ActionKind::Wipe => {
+                if dead_count == 0 {
+                    Err("no dead sessions left; nothing to wipe".into())
+                } else {
+                    Ok(())
+                }
+            }
+            ActionKind::Kill => match found {
+                Some(_) => Ok(()),
+                None => Err(format!("'{}' is gone; nothing to kill", action.display)),
+            },
+            ActionKind::Detach => match found {
+                Some(Status::Attached | Status::Multi) => Ok(()),
+                Some(other) => Err(format!(
+                    "'{}' is no longer attached (now {}); nothing to detach",
+                    action.display,
+                    other.label()
+                )),
+                None => Err(format!("'{}' is gone; nothing to detach", action.display)),
+            },
+        }
+    }
+
+    /// 动作结果落账：先刷新再给结论（refresh 会清瞬态消息，顺序不能反）。
+    pub fn note_action_outcome(&mut self, action: &ConfirmAction, run: &cmd::Run) {
+        self.refresh();
+        self.status = Some(if run.success() {
+            match action.kind {
+                ActionKind::Wipe => "dead sessions wiped".to_string(),
+                _ => format!("'{}' {} done", action.display, action.kind.label()),
+            }
+        } else {
+            let detail = run.text();
+            let detail = detail.trim();
+            format!(
+                "{} '{}' failed (exit {}){}",
+                action.kind.label(),
+                action.display,
+                run.code,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )
+        });
+    }
+
+    // ------------------------------------------------------------- 重命名（T2.4 / FR-14）
+
+    fn open_rename(&mut self) {
+        let Some(session) = self.sessions().get(self.selected) else {
+            return;
+        };
+        self.rename = Some(RenameDraft {
+            target: session.full.clone(),
+            name: session.name.clone(),
+            error: None,
+        });
+        self.mode = Mode::Rename;
+    }
+
+    fn on_key_rename(&mut self, code: KeyCode) {
+        let Some(mut draft) = self.rename.take() else {
+            self.mode = Mode::List;
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::List;
+            }
+            KeyCode::Backspace => {
+                draft.error = None;
+                draft.name.pop();
+                self.rename = Some(draft);
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                draft.error = None;
+                draft.name.push(c);
+                self.rename = Some(draft);
+            }
+            KeyCode::Enter => {
+                let name = draft.name.trim().to_string();
+                if let Err(err) = validate_name(&name) {
+                    draft.error = Some(err);
+                    self.rename = Some(draft);
+                    return;
+                }
+                self.mode = Mode::List;
+                self.rename_request = Some(RenameRequest {
+                    target: draft.target,
+                    new_name: name,
+                });
+            }
+            _ => {
+                self.rename = Some(draft);
+            }
+        }
+    }
+
+    /// 事件循环取走重命名请求。
+    pub fn take_rename_request(&mut self) -> Option<RenameRequest> {
+        self.rename_request.take()
+    }
+
+    /// 重命名结果落账（FR-14 验收：列表立即按新名显示）。
+    pub fn note_rename_outcome(&mut self, request: &RenameRequest, run: &cmd::Run) {
+        self.refresh();
+        self.status = Some(if run.success() {
+            format!("session renamed to '{}'", request.new_name)
+        } else {
+            format!("rename failed (exit {}): {}", run.code, run.text().trim())
         });
     }
 
@@ -687,7 +1047,13 @@ pub fn run() -> u8 {
         }
     };
 
+    // escape 前缀（FR-18）：配置显式覆盖 > `.screenrc` 探测 > 默认（None 回退）。
+    let explicit_prefix = loaded.config.defaults.escape_prefix.clone();
     let mut app = App::with_config(caps, loaded.config);
+    app.escape_prefix = match explicit_prefix {
+        Some(explicit) => Some(explicit),
+        None => detect_escape_prefix(),
+    };
     // $STY 非空 = 已经在一个 screen 会话里（FR-03 验收 5）：警告一次，不阻塞。
     if std::env::var("STY").map(|v| !v.is_empty()).unwrap_or(false) {
         app.status = Some(
@@ -745,7 +1111,8 @@ fn event_loop(
 
         // 连接请求：suspend → 前台 screen → resume → 强制重绘（1.5d）。
         if let Some(request) = app.take_attach_request() {
-            match attach_foreground(terminal, guard, &request) {
+            let hint = detach_hint_text(app.escape_prefix.as_deref());
+            match attach_foreground(terminal, guard, &request, &hint) {
                 Ok(run) => app.note_attach_outcome(&request, &run),
                 Err(err) => {
                     app.mode = Mode::List;
@@ -754,6 +1121,41 @@ fn event_loop(
             }
             // 子进程画过屏幕：清掉 ratatui 的 diff 基线，强制整屏重绘。
             terminal.clear()?;
+        }
+
+        // 危险动作（T2.4）：确认框通过后，**执行前**拿新鲜枚举重校验（NFR-08）。
+        if let Some(action) = app.take_action() {
+            let validation = match parse::enumerate() {
+                Ok(fresh) => app.validate_action(fresh, &action),
+                Err(err) => Err(format!(
+                    "cannot verify sessions before {}: {err}",
+                    action.kind.label()
+                )),
+            };
+            match validation {
+                Ok(()) => match cmd::action(action.kind.to_cmd(), &action.target) {
+                    Ok(run) => app.note_action_outcome(&action, &run),
+                    Err(err) => {
+                        app.refresh();
+                        app.status = Some(format!("{} failed: {err}", action.kind.label()));
+                    }
+                },
+                Err(message) => {
+                    app.refresh();
+                    app.status = Some(message);
+                }
+            }
+        }
+
+        // 重命名（T2.4 / FR-14）：`-X sessionname` 是亚秒级动作，直接在循环里执行。
+        if let Some(request) = app.take_rename_request() {
+            match cmd::rename(&request.target, &request.new_name) {
+                Ok(run) => app.note_rename_outcome(&request, &run),
+                Err(err) => {
+                    app.refresh();
+                    app.status = Some(format!("rename failed: {err}"));
+                }
+            }
         }
     }
     Ok(())
@@ -764,6 +1166,7 @@ fn attach_foreground(
     terminal: &mut ui::TuiTerminal,
     guard: &mut ui::TuiGuard,
     request: &AttachRequest,
+    hint: &str,
 ) -> crate::screen::Result<crate::screen::cmd::Run> {
     use std::io::Write;
 
@@ -772,8 +1175,9 @@ fn attach_foreground(
     guard.suspend()?;
 
     // 1.5c：detach 提示打印到真实终端（留在滚动缓冲里，不进 TUI 画面）。
+    // FR-18：前缀按探测/配置结果给出。
     let mut stdout = std::io::stdout();
-    let _ = writeln!(stdout, "{}", detach_hint());
+    let _ = writeln!(stdout, "{hint}");
     let _ = stdout.flush();
 
     let run = cmd::attach(request.kind, &request.target);
@@ -1225,10 +1629,287 @@ mod tests {
     }
 
     #[test]
-    fn detach_hint_mentions_default_prefix_and_customization() {
-        let hint = detach_hint();
-        assert!(hint.contains("Ctrl-A D"), "{hint}");
-        assert!(hint.contains("your own prefix"), "{hint}");
+    fn detach_hint_text_covers_probed_and_default_paths() {
+        // 探测到前缀：按实际前缀提示（FR-18 验收）。
+        assert_eq!(
+            detach_hint_text(Some("Ctrl-]")),
+            "Tip: detach with Ctrl-] d"
+        );
+        // 探测不到：回退默认并注明可自定义。
+        let fallback = detach_hint_text(None);
+        assert!(fallback.contains("Ctrl-A D"), "{fallback}");
+        assert!(fallback.contains("your own prefix"), "{fallback}");
+    }
+
+    // ------------------------------------------------------------- T2.4 会话操作
+
+    /// 构造一个确认动作（测试辅助）。
+    fn confirm_action(kind: ActionKind, full: &str) -> ConfirmAction {
+        ConfirmAction {
+            kind,
+            target: full.into(),
+            display: full.split('.').nth(1).unwrap_or(full).into(),
+            command: None,
+            focus_yes: false,
+        }
+    }
+
+    #[test]
+    fn confirm_defaults_to_cancel_and_y_explicitly_confirms() {
+        let mut app = app_with(FOUR);
+        app.selected = 2; // llm（attached）
+
+        // D 打开 detach 确认。
+        app.on_key(key(KeyCode::Char('D')));
+        assert_eq!(app.mode, Mode::Confirm);
+        let confirm = app.confirm.as_ref().unwrap();
+        assert_eq!(confirm.kind, ActionKind::Detach);
+        assert_eq!(confirm.target, "12346.llm");
+        assert!(!confirm.focus_yes, "default focus must be cancel (FR-13)");
+
+        // Enter（焦点在取消）→ 只关闭，不执行。
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.take_action().is_none());
+
+        // y 显式确认 → 产出动作请求。
+        app.on_key(key(KeyCode::Char('D')));
+        app.on_key(key(KeyCode::Char('y')));
+        let action = app.take_action().expect("y must confirm");
+        assert_eq!(action.kind, ActionKind::Detach);
+        assert!(app.take_action().is_none(), "request consumed once");
+    }
+
+    #[test]
+    fn confirm_focus_toggle_redirects_enter() {
+        let mut app = app_with(FOUR);
+        app.selected = 0; // dep（detached）→ K 终止确认
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(app.mode, Mode::Confirm);
+        assert_eq!(app.confirm.as_ref().unwrap().kind, ActionKind::Kill);
+
+        // Tab 切到「确认」，Enter 执行焦点项。
+        app.on_key(key(KeyCode::Tab));
+        assert!(app.confirm.as_ref().unwrap().focus_yes);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.take_action().is_some());
+
+        // n / Esc 任何焦点下都取消。
+        app.on_key(key(KeyCode::Char('K')));
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.take_action().is_none());
+    }
+
+    #[test]
+    fn kill_confirm_carries_probed_command() {
+        let mut app = app_with(FOUR);
+        app.selected = 0;
+        app.meta = Some(probe::Meta {
+            cwd: Some("/srv/app".into()),
+            command: Some("/bin/zsh -l".into()),
+        });
+        app.on_key(key(KeyCode::Char('K')));
+        let confirm = app.confirm.as_ref().unwrap();
+        // FR-13 验收 2：确认框里显示会话名 + 运行命令。
+        assert_eq!(confirm.display, "dep");
+        assert_eq!(confirm.command.as_deref(), Some("/bin/zsh -l"));
+    }
+
+    #[test]
+    fn detach_entry_is_restricted_to_attached_sessions() {
+        let mut app = app_with(FOUR);
+        app.selected = 0; // dep（detached）
+        app.on_key(key(KeyCode::Char('D')));
+        assert_eq!(
+            app.mode,
+            Mode::List,
+            "detached target must not open confirm"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not attached")
+        );
+    }
+
+    #[test]
+    fn wipe_entry_lists_dead_sessions_and_wipe_without_dead_is_refused() {
+        let mut app = app_with(FOUR); // legacy 是 dead
+        app.on_key(key(KeyCode::Char('W')));
+        assert_eq!(app.mode, Mode::Confirm);
+        assert_eq!(app.confirm.as_ref().unwrap().kind, ActionKind::Wipe);
+        app.on_key(key(KeyCode::Esc));
+
+        // 无 dead 会话时 W 只给提示，不弹确认框。
+        let mut clean = app_with(
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
+        );
+        clean.on_key(key(KeyCode::Char('W')));
+        assert_eq!(clean.mode, Mode::List);
+        assert!(
+            clean
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("nothing to wipe")
+        );
+    }
+
+    #[test]
+    fn validate_action_rechecks_with_fresh_enumeration() {
+        let mut app = app_with(FOUR);
+
+        // 目标已消失 → 拒绝。
+        let mut gone = confirm_action(ActionKind::Kill, "99999.gone");
+        gone.display = "gone".into();
+        let fresh = enumeration(
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
+        );
+        assert!(app.validate_action(fresh, &gone).is_err());
+
+        // detach 目标已变回 detached → 拒绝（状态不匹配）。
+        let mismatch = confirm_action(ActionKind::Detach, "12346.llm");
+        let now_detached = enumeration(
+            "There is a screen on:\n\t12346.llm\t(09/23/2026 10:01:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
+        );
+        assert!(app.validate_action(now_detached, &mismatch).is_err());
+
+        // detach 目标仍 attached → 通过。
+        let ok = confirm_action(ActionKind::Detach, "12346.llm");
+        let attached_fresh = enumeration(
+            "There is a screen on:\n\t12346.llm\t(09/23/2026 10:01:00 AM)\t(Attached)\n1 Socket in /tmp/.screen.\n",
+        );
+        assert!(app.validate_action(attached_fresh, &ok).is_ok());
+
+        // wipe：无 dead → 拒绝；有 dead → 通过。
+        let wipe = confirm_action(ActionKind::Wipe, "");
+        let no_dead = enumeration(
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
+        );
+        assert!(app.validate_action(no_dead, &wipe).is_err());
+        assert!(app.validate_action(enumeration(FOUR), &wipe).is_ok());
+    }
+
+    #[test]
+    fn rename_flow_edits_validates_and_produces_request() {
+        let mut app = app_with(FOUR);
+        app.selected = 2; // llm
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(app.mode, Mode::Rename);
+        assert_eq!(app.rename.as_ref().unwrap().name, "llm");
+        assert_eq!(app.rename.as_ref().unwrap().target, "12346.llm");
+
+        // 编辑为非法名 → 报错并留在输入框。
+        app.rename.as_mut().unwrap().name = "-bad".into();
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.rename.as_ref().unwrap().error.is_some());
+        assert!(app.take_rename_request().is_none());
+
+        // 合法名 → 产出重命名请求。
+        app.rename.as_mut().unwrap().name = "renamed".into();
+        app.on_key(key(KeyCode::Enter));
+        let request = app.take_rename_request().expect("rename request");
+        assert_eq!(request.target, "12346.llm");
+        assert_eq!(request.new_name, "renamed");
+        assert_eq!(app.mode, Mode::List);
+
+        // Esc 取消。
+        app.on_key(key(KeyCode::Char('r')));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.rename.is_none());
+    }
+
+    #[test]
+    fn rename_outcome_reports_success_and_failure() {
+        let mut app = app_with(FOUR);
+        let request = RenameRequest {
+            target: "12346.llm".into(),
+            new_name: "renamed".into(),
+        };
+        let ok_run = cmd::Run {
+            command: "screen -S 12346.llm -X sessionname renamed".into(),
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        app.note_rename_outcome(&request, &ok_run);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("renamed to 'renamed'")
+        );
+
+        let fail_run = cmd::Run {
+            command: "screen -S 12346.llm -X sessionname renamed".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: "no such session".into(),
+        };
+        app.note_rename_outcome(&request, &fail_run);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rename failed")
+        );
+    }
+
+    #[test]
+    fn action_outcome_reports_success_and_failure() {
+        let mut app = app_with(FOUR);
+        let action = confirm_action(ActionKind::Kill, "12346.llm");
+        let ok_run = cmd::Run {
+            command: "screen -S 12346.llm -X quit".into(),
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        app.note_action_outcome(&action, &ok_run);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kill done")
+        );
+
+        let fail_run = cmd::Run {
+            command: "screen -S 12346.llm -X quit".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: "no such session".into(),
+        };
+        app.note_action_outcome(&action, &fail_run);
+        let status = app.status.as_deref().unwrap_or_default();
+        assert!(status.contains("kill"), "{status}");
+        assert!(status.contains("exit 1"), "{status}");
+    }
+
+    #[test]
+    fn screenrc_escape_parser_covers_both_forms() {
+        // 单 token 形态：escape ^Aa
+        assert_eq!(
+            parse_screenrc_escape("escape ^Aa\n").as_deref(),
+            Some("Ctrl-A")
+        );
+        // 两 token 形态：escape x x（字面前缀）
+        assert_eq!(parse_screenrc_escape("escape x x\n").as_deref(), Some("x"));
+        // 带注释与缩进的行。
+        assert_eq!(
+            parse_screenrc_escape("  escape ^]]   # my prefix\n").as_deref(),
+            Some("Ctrl-]")
+        );
+        // 非 escape 行不干扰。
+        assert_eq!(parse_screenrc_escape("term xterm-256color\n"), None);
+        assert_eq!(parse_screenrc_escape(""), None);
+        // 未改前缀的 ^Aa 返回 Ctrl-A，与默认一致 —— 提示文本不变。
+        assert_eq!(
+            parse_screenrc_escape("escape ^Aa"),
+            parse_screenrc_escape("# nothing\nescape ^Aa")
+        );
     }
 
     /// M1 出口自查：40 列目标尺寸下「看 → 选 → 进 → 出」纯键盘全流程 +

@@ -153,7 +153,92 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
                 render_attach_choice(f, choice);
             }
         }
+        Mode::Confirm => {
+            render_list_screen(f, app);
+            if let Some(confirm) = &app.confirm {
+                render_confirm(f, confirm);
+            }
+        }
+        Mode::Rename => {
+            render_list_screen(f, app);
+            if let Some(draft) = &app.rename {
+                render_rename(f, draft);
+            }
+        }
     }
+}
+
+/// 危险操作确认框（FR-13）：显示会话名 + 探测到的运行命令，
+/// 默认焦点在**取消**（小屏误触防线），后果动词显式标出。
+fn render_confirm(f: &mut Frame<'_>, confirm: &crate::app::ConfirmAction) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(" Confirm: {}", confirm.kind.consequence()),
+            Style::default()
+                .fg(ratatui::style::Color::Red)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(" session: {}", confirm.display)),
+    ];
+    if let Some(command) = &confirm.command {
+        lines.push(Line::from(format!(" command: {command}")));
+    }
+    lines.push(Line::from(""));
+
+    // 焦点用反显标出：Enter 执行的是焦点项，所以焦点必须一眼可辨。
+    let (yes_style, no_style) = if confirm.focus_yes {
+        (theme::selected_row(), Style::default())
+    } else {
+        (Style::default(), theme::selected_row())
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" [ Yes ] ", yes_style),
+        Span::styled(" [ Cancel ] ", no_style),
+    ]));
+    lines.push(Line::from(Span::styled(
+        " ←/→ switch focus · Enter run focused · y confirm · Esc cancel",
+        theme::dimmed(),
+    )));
+
+    let height = lines.len() as u16 + 2;
+    let area = centered_rect(f.area(), 62, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(format!(" {} ", confirm.kind.label().to_uppercase()))),
+        area,
+    );
+}
+
+/// 重命名输入框（FR-14）。
+fn render_rename(f: &mut Frame<'_>, draft: &crate::app::RenameDraft) {
+    let mut lines = vec![
+        Line::from(" New name:"),
+        Line::from(Span::styled(
+            format!(" {}", draft.name),
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if let Some(error) = &draft.error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(ratatui::style::Color::Red),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter rename · Esc cancel",
+        theme::dimmed(),
+    )));
+
+    let height = lines.len() as u16 + 2;
+    let area = centered_rect(f.area(), 46, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Rename ")),
+        area,
+    );
 }
 
 /// attached 冲突选择框（1.5b）：1 共享 / 2 接管 / Esc 取消。

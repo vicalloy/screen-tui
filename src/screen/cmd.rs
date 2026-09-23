@@ -264,6 +264,108 @@ pub fn attach_with(program: &Path, kind: AttachKind, target: &str) -> Result<Run
     })
 }
 
+// ------------------------------------------------------------- 会话动作（T2.4）
+
+/// 会话级管理动作（FR-12/13/20）。全部走 `-X` / `-wipe`，**没有任何 `stuff` 路径**
+/// （需求 §1.3 非目标 #1：绝不向用户会话注入按键）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAction {
+    /// 远程断开：`-S <full> -X detach`（不进入会话，FR-12）。
+    Detach,
+    /// 终止会话：`-S <full> -X quit`（FR-13）。
+    Kill,
+    /// 清理 dead 会话：`screen -wipe`（全局动作，无目标，FR-20）。
+    Wipe,
+}
+
+impl SessionAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionAction::Detach => "detach",
+            SessionAction::Kill => "kill",
+            SessionAction::Wipe => "wipe",
+        }
+    }
+}
+
+/// 动作参数拼装（纯函数，供替身测试断言）。`target` 是 `<pid>.<name>` 全名。
+pub fn action_args(action: SessionAction, target: &str) -> Vec<OsString> {
+    match action {
+        SessionAction::Detach => vec![
+            OsString::from("-S"),
+            OsString::from(target),
+            OsString::from("-X"),
+            OsString::from("detach"),
+        ],
+        SessionAction::Kill => vec![
+            OsString::from("-S"),
+            OsString::from(target),
+            OsString::from("-X"),
+            OsString::from("quit"),
+        ],
+        SessionAction::Wipe => vec![OsString::from("-wipe")],
+    }
+}
+
+/// 重命名参数拼装（纯函数，FR-14）：`-S <full> -X sessionname <new>`。
+pub fn rename_args(target: &str, new_name: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("-S"),
+        OsString::from(target),
+        OsString::from("-X"),
+        OsString::from("sessionname"),
+        OsString::from(new_name),
+    ]
+}
+
+/// 执行会话动作（捕获输出，便于失败时给出可读原因）。
+pub fn action(action: SessionAction, target: &str) -> Result<Run> {
+    let program = program()?;
+    action_with(&program, action, target)
+}
+
+/// [`action`] 的注入版。
+pub fn action_with(program: &Path, action: SessionAction, target: &str) -> Result<Run> {
+    let args = action_args(action, target);
+    let output = Command::new(program)
+        .args(&args)
+        .output()
+        .map_err(|source| Error::Spawn {
+            program: program.display().to_string(),
+            source,
+        })?;
+    Ok(Run {
+        command: display_command(program, &args),
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// 重命名运行中的会话（FR-14）。
+pub fn rename(target: &str, new_name: &str) -> Result<Run> {
+    let program = program()?;
+    rename_with(&program, target, new_name)
+}
+
+/// [`rename`] 的注入版。
+pub fn rename_with(program: &Path, target: &str, new_name: &str) -> Result<Run> {
+    let args = rename_args(target, new_name);
+    let output = Command::new(program)
+        .args(&args)
+        .output()
+        .map_err(|source| Error::Spawn {
+            program: program.display().to_string(),
+            source,
+        })?;
+    Ok(Run {
+        command: display_command(program, &args),
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +526,78 @@ mod tests {
 
         let recorded = std::fs::read_to_string(&record).unwrap();
         assert!(recorded.contains("-U -d -r 12345.work"), "{recorded}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ------------------------------------------------------------- T2.4 会话动作
+
+    #[test]
+    fn action_args_match_the_documented_commands() {
+        let flat = |args: &[OsString]| {
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            flat(&action_args(SessionAction::Detach, "12345.work")),
+            vec!["-S", "12345.work", "-X", "detach"]
+        );
+        assert_eq!(
+            flat(&action_args(SessionAction::Kill, "12345.work")),
+            vec!["-S", "12345.work", "-X", "quit"]
+        );
+        // wipe 是全局动作：不带 -S 目标。
+        assert_eq!(flat(&action_args(SessionAction::Wipe, "")), vec!["-wipe"]);
+    }
+
+    #[test]
+    fn rename_args_carry_sessionname_subcommand() {
+        let flat: Vec<String> = rename_args("12345.work", "new-name")
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            flat,
+            vec!["-S", "12345.work", "-X", "sessionname", "new-name"]
+        );
+    }
+
+    #[test]
+    fn actions_run_through_the_fake_screen() {
+        let tmp = std::env::temp_dir().join(format!("stui-action-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = fake_screen(&tmp, "echo \"ARGS:$@\"; exit 0");
+
+        let run = action_with(&script, SessionAction::Detach, "12345.work").unwrap();
+        assert!(run.success());
+        assert!(run.stdout.contains("ARGS:-S 12345.work -X detach"));
+
+        let run = action_with(&script, SessionAction::Kill, "12346.llm").unwrap();
+        assert!(run.stdout.contains("ARGS:-S 12346.llm -X quit"));
+
+        let run = action_with(&script, SessionAction::Wipe, "").unwrap();
+        assert!(run.stdout.contains("ARGS:-wipe"));
+
+        let run = rename_with(&script, "12345.work", "renamed").unwrap();
+        assert!(
+            run.stdout
+                .contains("ARGS:-S 12345.work -X sessionname renamed")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn failing_action_surfaces_exit_code_and_text() {
+        let tmp = std::env::temp_dir().join(format!("stui-action-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = fake_screen(&tmp, "echo no such session >&2; exit 1");
+
+        let run = action_with(&script, SessionAction::Detach, "99999.gone").unwrap();
+        assert!(!run.success());
+        assert_eq!(run.code, 1);
+        assert!(run.stderr.contains("no such session"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
