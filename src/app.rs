@@ -46,6 +46,8 @@ pub enum Mode {
     Filter,
     /// `p` 预览快照（FR-15）。
     Preview,
+    /// 别名/描述单行编辑（FR-24）。
+    MetaEdit,
 }
 
 /// 向导步骤：名 → 目录 → 命令，每步回车即接受默认值（FR-02 验收 1）。
@@ -168,6 +170,8 @@ pub enum ActionKind {
     Kill,
     /// 清理 dead 会话（FR-20）。
     Wipe,
+    /// 清理已消失会话的本工具元数据（T2.6，不碰 screen 资源）。
+    Cleanup,
 }
 
 impl ActionKind {
@@ -176,6 +180,7 @@ impl ActionKind {
             ActionKind::Detach => "detach",
             ActionKind::Kill => "kill",
             ActionKind::Wipe => "wipe",
+            ActionKind::Cleanup => "cleanup",
         }
     }
 
@@ -185,14 +190,16 @@ impl ActionKind {
             ActionKind::Detach => "detach the attached client (it keeps running)",
             ActionKind::Kill => "TERMINATE the session and all its windows",
             ActionKind::Wipe => "remove all dead session sockets",
+            ActionKind::Cleanup => "forget metadata of sessions that no longer exist",
         }
     }
 
-    fn to_cmd(self) -> cmd::SessionAction {
+    fn to_cmd(self) -> Option<cmd::SessionAction> {
         match self {
-            ActionKind::Detach => cmd::SessionAction::Detach,
-            ActionKind::Kill => cmd::SessionAction::Kill,
-            ActionKind::Wipe => cmd::SessionAction::Wipe,
+            ActionKind::Detach => Some(cmd::SessionAction::Detach),
+            ActionKind::Kill => Some(cmd::SessionAction::Kill),
+            ActionKind::Wipe => Some(cmd::SessionAction::Wipe),
+            ActionKind::Cleanup => None, // 纯配置操作，不经 screen。
         }
     }
 }
@@ -248,6 +255,39 @@ pub struct PreviewRequest {
     pub name: String,
     /// `true` = 用户按了 `p`（失败要给可读提示）；`false` = 宽屏自动跟随（失败静默降级）。
     pub manual: bool,
+}
+
+/// managed 会话重启请求（FR-24）：用记录的 command+cwd 重建。
+#[derive(Debug, Clone)]
+pub struct RestartRequest {
+    pub name: String,
+    pub dir: PathBuf,
+    pub command: String,
+}
+
+/// 元数据字段编辑（别名 / 描述）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaField {
+    Alias,
+    Note,
+}
+
+impl MetaField {
+    pub fn key(self) -> &'static str {
+        match self {
+            MetaField::Alias => "alias",
+            MetaField::Note => "note",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MetaEdit {
+    /// 元数据键 = 会话名。
+    pub session: String,
+    pub field: MetaField,
+    pub value: String,
+    pub error: Option<String>,
 }
 
 /// `.screenrc` 的 `escape` 行解析（FR-18，纯函数）。
@@ -370,6 +410,14 @@ pub struct App {
     last_preview_target: Option<String>,
     /// 待事件循环执行的预览抓取请求。
     preview_request: Option<PreviewRequest>,
+    /// 待事件循环执行的重启请求（T2.6：managed 会话重建）。
+    restart_request: Option<RestartRequest>,
+    /// 元数据字段编辑状态；仅在 `Mode::MetaEdit` 期间非空。
+    pub meta_edit: Option<MetaEdit>,
+    /// 配置落盘路径覆盖（测试注入）；`None` = 标准位置。
+    pub config_path_override: Option<PathBuf>,
+    /// 加载时被告知的只读状态（配置版本比本工具新）。
+    pub config_read_only: bool,
     /// 会话枚举器（NFR-10 可测性）：生产用 [`parse::enumerate`]，
     /// 测试注入替身 —— 与 M1 的 `plan_connect` 注入风格一致，但覆盖所有调用点。
     enumerate: fn() -> crate::screen::Result<Enumeration>,
@@ -411,6 +459,10 @@ impl App {
             preview: None,
             last_preview_target: None,
             preview_request: None,
+            restart_request: None,
+            meta_edit: None,
+            config_path_override: None,
+            config_read_only: false,
             enumerate: parse::enumerate,
             action_request: None,
             rename_request: None,
@@ -635,12 +687,14 @@ impl App {
         }
         match self.mode {
             Mode::List => self.on_key_list(key.code),
-            Mode::Help | Mode::Detail | Mode::Preview => self.on_key_overlay(key.code),
+            Mode::Help | Mode::Preview => self.on_key_overlay(key.code),
+            Mode::Detail => self.on_key_detail(key.code),
             Mode::NewSession => self.on_key_new(key.code),
             Mode::AttachChoice => self.on_key_attach_choice(key.code),
             Mode::Confirm => self.on_key_confirm(key.code),
             Mode::Rename => self.on_key_rename(key.code),
             Mode::Filter => self.on_key_filter(key.code),
+            Mode::MetaEdit => self.on_key_meta_edit(key.code),
         }
     }
 
@@ -670,6 +724,9 @@ impl App {
             KeyCode::Char('x') => self.start_share(),
             // 预览快照（FR-15）。
             KeyCode::Char('p') => self.open_preview(),
+            // `s` 重启（T2.6）/ `X` 手动元数据清理（GC = 手动）在 List 层的入口。
+            KeyCode::Char('s') => self.restart_selected(),
+            KeyCode::Char('X') => self.open_cleanup(),
             KeyCode::Char('n') => self.open_new_session(),
             // 数字键 1–9 直连对应序号（§6.4 核心键）。
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
@@ -798,6 +855,14 @@ impl App {
         self.mode = Mode::List;
         // 先刷新再落账：refresh() 成功时会清掉瞬态消息，结果消息必须留在最后。
         self.refresh();
+        // 连接过的会话留观察记录（FR-24）：managed 条目只更新 last_seen。
+        let name = request
+            .target
+            .split_once('.')
+            .map(|(_, n)| n.to_string())
+            .unwrap_or_else(|| request.target.clone());
+        self.record_seen(&name);
+        self.save_config();
         self.status = Some(if run.success() {
             format!("detached from '{}'", request.target)
         } else {
@@ -901,12 +966,232 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------- 元数据持久化（T2.6 / FR-24）
+
+    /// 配置落盘。返回 `false` = 没写成（无路径 / 只读保护），调用方给用户提示。
+    fn save_config(&self) -> bool {
+        if self.config_read_only {
+            return false;
+        }
+        let path = self
+            .config_path_override
+            .clone()
+            .or_else(crate::config::config_path);
+        matches!(
+            crate::config::save_to(&self.config, path.as_deref()),
+            Ok(true)
+        )
+    }
+
+    /// 记录「见过这个会话」：managed 条目保留业务字段，外部会话只留观察记录。
+    fn record_seen(&mut self, name: &str) {
+        let now = crate::util::time::local_datetime(std::time::SystemTime::now());
+        let entry = self.config.sessions.entry(name.to_string()).or_default();
+        entry.last_seen = Some(now);
+    }
+
+    /// 记录本工具创建的会话（managed，可重启）。
+    fn record_managed(&mut self, name: &str, dir: &str, command: &str) {
+        let now = crate::util::time::local_datetime(std::time::SystemTime::now());
+        let entry = self.config.sessions.entry(name.to_string()).or_default();
+        entry.managed = true;
+        entry.command = Some(command.to_string());
+        entry.cwd = Some(dir.to_string());
+        entry.last_seen = Some(now);
+    }
+
+    /// `s` 重启入口：只对**本工具创建**（managed）且已 dead 的会话开放；
+    /// unmanaged 明确拒绝（FR-24 验收 1：绝不假设有权重启别人的会话）。
+    fn restart_selected(&mut self) {
+        let Some(session) = self.sessions().get(self.selected).cloned() else {
+            return;
+        };
+        if session.status != Status::Dead {
+            self.status = Some(format!(
+                "'{}' is still running; restart applies to dead sessions",
+                session.name
+            ));
+            return;
+        }
+        let Some(meta) = self.config.sessions.get(&session.name).cloned() else {
+            self.status = Some(format!(
+                "'{}' was not created by stui; restart is unavailable",
+                session.name
+            ));
+            return;
+        };
+        if !meta.managed {
+            self.status = Some(format!(
+                "'{}' is unmanaged; restart is only available for sessions created by stui",
+                session.name
+            ));
+            return;
+        }
+        let (Some(command), Some(cwd)) = (meta.command.clone(), meta.cwd.clone()) else {
+            self.status = Some(format!(
+                "'{}' has no recorded command/cwd; cannot restart",
+                session.name
+            ));
+            return;
+        };
+        self.restart_request = Some(RestartRequest {
+            name: session.name.clone(),
+            dir: PathBuf::from(cwd),
+            command,
+        });
+    }
+
+    /// 重启结果落账。
+    pub fn note_restart_outcome(&mut self, request: &RestartRequest, run: &cmd::Run) {
+        self.refresh();
+        if run.success() {
+            self.record_managed(
+                &request.name,
+                &request.dir.display().to_string(),
+                &request.command,
+            );
+            self.save_config();
+            self.status = Some(format!(
+                "restarted '{}' with its recorded command",
+                request.name
+            ));
+        } else {
+            self.status = Some(format!(
+                "restart of '{}' failed (exit {}): {}",
+                request.name,
+                run.code,
+                run.text().trim()
+            ));
+        }
+    }
+
+    /// 事件循环取走重启请求。
+    pub fn take_restart_request(&mut self) -> Option<RestartRequest> {
+        self.restart_request.take()
+    }
+
+    /// `X` 手动元数据清理（GC 策略 = 手动，requirements §14）：删除已消失会话的元数据。
+    /// 返回 None = 没有可清理项（status 已给提示）。
+    fn open_cleanup(&mut self) {
+        let stale = self.stale_metadata_names();
+        if stale.is_empty() {
+            self.status = Some("no stale session metadata to clean".into());
+            return;
+        }
+        let count = stale.len();
+        self.confirm = Some(ConfirmAction {
+            kind: ActionKind::Cleanup,
+            target: String::new(),
+            display: format!("{count} stale metadata entrie(s)"),
+            command: Some(stale.join(", ")),
+            focus_yes: false,
+        });
+        self.mode = Mode::Confirm;
+    }
+
+    /// 已消失会话的元数据键列表。
+    fn stale_metadata_names(&self) -> Vec<String> {
+        self.config
+            .sessions
+            .keys()
+            .filter(|name| !self.all_sessions().iter().any(|s| &s.name == *name))
+            .cloned()
+            .collect()
+    }
+
+    /// 执行清理（确认框确认后）：只删元数据，不碰任何 screen 资源。
+    fn run_cleanup(&mut self) {
+        let stale = self.stale_metadata_names();
+        let count = stale.len();
+        for name in &stale {
+            self.config.sessions.remove(name);
+        }
+        let saved = self.save_config();
+        self.status = Some(if saved {
+            format!("removed {count} stale metadata entrie(s)")
+        } else {
+            format!(
+                "removed {count} stale metadata entrie(s) for this session only (no config file written)"
+            )
+        });
+    }
+
+    /// 打开元数据字段编辑（详情弹层 `a` / `t`）。
+    fn open_meta_edit(&mut self, field: MetaField) {
+        let visible = self.sessions();
+        let Some(session) = visible.get(self.selected) else {
+            return;
+        };
+        let name = session.name.clone();
+        let current = self
+            .config
+            .sessions
+            .get(&name)
+            .and_then(|m| match field {
+                MetaField::Alias => m.alias.clone(),
+                MetaField::Note => m.note.clone(),
+            })
+            .unwrap_or_default();
+        self.meta_edit = Some(MetaEdit {
+            session: name,
+            field,
+            value: current,
+            error: None,
+        });
+        self.mode = Mode::MetaEdit;
+    }
+
+    fn on_key_meta_edit(&mut self, code: KeyCode) {
+        let Some(mut edit) = self.meta_edit.take() else {
+            self.mode = Mode::List;
+            return;
+        };
+        match code {
+            KeyCode::Esc => self.mode = Mode::List,
+            KeyCode::Backspace => {
+                edit.value.pop();
+                self.meta_edit = Some(edit);
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                edit.value.push(c);
+                self.meta_edit = Some(edit);
+            }
+            KeyCode::Enter => {
+                let value = edit.value.trim().to_string();
+                let entry = self
+                    .config
+                    .sessions
+                    .entry(edit.session.clone())
+                    .or_default();
+                match edit.field {
+                    MetaField::Alias => entry.alias = (!value.is_empty()).then_some(value),
+                    MetaField::Note => entry.note = (!value.is_empty()).then_some(value),
+                }
+                let field_label = edit.field.key().to_string();
+                let session = edit.session;
+                let saved = self.save_config();
+                self.meta_edit = None;
+                self.mode = Mode::List;
+                self.status = Some(if saved {
+                    format!("'{session}' {field_label} updated")
+                } else {
+                    format!(
+                        "'{session}' {field_label} kept for this session only (no config file written)"
+                    )
+                });
+            }
+            _ => self.meta_edit = Some(edit),
+        }
+    }
+
     // ------------------------------------------------------------- 会话动作（T2.4）
 
     /// 打开危险操作确认框（FR-13）。入口即校验（NFR-08 的第一道），
     /// 但**执行前**事件循环还会拿新鲜枚举再验一次 —— 中间只隔确认框，仍可能变化。
     fn open_confirm(&mut self, kind: ActionKind) {
         match kind {
+            // Cleanup 有自己的入口（open_cleanup），不经这里。
+            ActionKind::Cleanup => return,
             ActionKind::Wipe => {
                 if !self.sessions().iter().any(|s| s.status == Status::Dead) {
                     self.status = Some("no dead sessions; nothing to wipe".into());
@@ -958,14 +1243,11 @@ impl App {
                 self.confirm = Some(confirm);
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.mode = Mode::List;
-                self.action_request = Some(confirm);
+                confirm.focus_yes = true;
+                self.settle_confirm(confirm);
             }
             KeyCode::Enter => {
-                self.mode = Mode::List;
-                if confirm.focus_yes {
-                    self.action_request = Some(confirm);
-                }
+                self.settle_confirm(confirm);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = Mode::List;
@@ -973,6 +1255,18 @@ impl App {
             _ => {
                 self.confirm = Some(confirm);
             }
+        }
+    }
+
+    /// 确认框落定：Cleanup 纯配置操作直接执行；其余产出动作请求交事件循环。
+    fn settle_confirm(&mut self, confirm: ConfirmAction) {
+        self.mode = Mode::List;
+        if !confirm.focus_yes {
+            return; // 焦点在取消：只关闭。
+        }
+        match confirm.kind {
+            ActionKind::Cleanup => self.run_cleanup(),
+            _ => self.action_request = Some(confirm),
         }
     }
 
@@ -1023,6 +1317,9 @@ impl App {
                 )),
                 None => Err(format!("'{}' is gone; nothing to detach", action.display)),
             },
+            // Cleanup 只动本工具的配置，无 screen 语义可校验；确认框内直接执行，
+            // 正常不会走到这里（防御性放行）。
+            ActionKind::Cleanup => Ok(()),
         }
     }
 
@@ -1125,6 +1422,16 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('?') => {
                 self.mode = Mode::List;
             }
+            _ => {}
+        }
+    }
+
+    /// 详情弹层（T2.6）：`a` 别名、`t` 描述（FR-24），Esc/i/q 关闭。
+    fn on_key_detail(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('a') => self.open_meta_edit(MetaField::Alias),
+            KeyCode::Char('t') => self.open_meta_edit(MetaField::Note),
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('i') => self.mode = Mode::List,
             _ => {}
         }
     }
@@ -1269,6 +1576,10 @@ impl App {
                 }
             ));
         }
+
+        // 创建成功：记录 managed 元数据（FR-24 验收 1：stui 创建 = 可重启）。
+        self.record_managed(name, dir, command);
+        self.save_config();
 
         // 创建成功后立刻重枚举，把选中项对准新会话（FR-02 验收 5）。
         match parse::enumerate() {
@@ -1422,12 +1733,16 @@ fn event_loop(
                 )),
             };
             match validation {
-                Ok(()) => match cmd::action(action.kind.to_cmd(), &action.target) {
-                    Ok(run) => app.note_action_outcome(&action, &run),
-                    Err(err) => {
-                        app.refresh();
-                        app.status = Some(format!("{} failed: {err}", action.kind.label()));
-                    }
+                Ok(()) => match action.kind.to_cmd() {
+                    Some(session_action) => match cmd::action(session_action, &action.target) {
+                        Ok(run) => app.note_action_outcome(&action, &run),
+                        Err(err) => {
+                            app.refresh();
+                            app.status = Some(format!("{} failed: {err}", action.kind.label()));
+                        }
+                    },
+                    // Cleanup 在确认框内直接执行，不产动作请求（防御性兜底）。
+                    None => app.status = Some("nothing to do".into()),
                 },
                 Err(message) => {
                     app.refresh();
@@ -1450,6 +1765,17 @@ fn event_loop(
         // 预览抓取（T2.3）：用户按 p 的手动请求。
         if let Some(request) = app.take_preview_request() {
             execute_preview(app, &request);
+        }
+
+        // 重启（T2.6）：managed 会话用记录的 command+cwd 重建。
+        if let Some(request) = app.take_restart_request() {
+            match cmd::create(&request.name, &request.dir, &request.command) {
+                Ok(run) => app.note_restart_outcome(&request, &run),
+                Err(err) => {
+                    app.refresh();
+                    app.status = Some(format!("restart failed: {err}"));
+                }
+            }
         }
 
         // 宽屏右栏自动预览（FR-15 验收 5）：选中项变化才抓，失败静默降级。
@@ -2400,6 +2726,159 @@ mod tests {
             app.wide_preview_due(true).is_some(),
             "cleared target retries"
         );
+    }
+
+    // ------------------------------------------------------------- T2.6 元数据持久化
+
+    fn app_with_config_dir(tag: &str) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("stui-t26-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app_with(FOUR);
+        app.config_path_override = Some(dir.join("config.json"));
+        (app, dir)
+    }
+
+    #[test]
+    fn managed_and_seen_records_land_in_config() {
+        let (mut app, dir) = app_with_config_dir("records");
+
+        // 创建 = managed（可重启）。
+        app.record_managed("newtask", "/srv/app", "claude");
+        let entry = app.config.sessions.get("newtask").unwrap();
+        assert!(entry.managed);
+        assert_eq!(entry.command.as_deref(), Some("claude"));
+        assert_eq!(entry.cwd.as_deref(), Some("/srv/app"));
+        assert!(entry.last_seen.is_some());
+
+        // 连接过的外部会话 = unmanaged 观察记录。
+        app.record_seen("dep");
+        let entry = app.config.sessions.get("dep").unwrap();
+        assert!(!entry.managed, "external sessions stay unmanaged");
+
+        // 落盘到注入路径（证明持久化真的发生）。
+        assert!(app.save_config());
+        let saved: crate::config::Config =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        assert!(saved.sessions.get("newtask").unwrap().managed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restart_is_restricted_to_dead_managed_sessions() {
+        let (mut app, dir) = app_with_config_dir("restart");
+
+        // detached 会话：无需重启。
+        app.selected = 0; // dep（detached）
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.take_restart_request().is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still running")
+        );
+
+        // dead 但没有元数据 → 明确拒绝。
+        app.selected = 1; // legacy（dead）
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.take_restart_request().is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not created by stui")
+        );
+
+        // dead + unmanaged 记录 → 拒绝（FR-24 验收 1）。
+        app.record_seen("legacy");
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.take_restart_request().is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unmanaged")
+        );
+
+        // dead + managed 记录 → 产出重启请求（记录的 command+cwd）。
+        app.record_managed("legacy", "/srv/legacy", "bash -l");
+        app.on_key(key(KeyCode::Char('s')));
+        let request = app.take_restart_request().expect("restart request");
+        assert_eq!(request.name, "legacy");
+        assert_eq!(request.command, "bash -l");
+        assert_eq!(request.dir, std::path::PathBuf::from("/srv/legacy"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_removes_only_stale_metadata_after_confirmation() {
+        let (mut app, dir) = app_with_config_dir("cleanup");
+        app.record_managed("gone-task", "/srv/gone", "top");
+        app.record_managed("legacy", "/srv/legacy", "bash -l"); // legacy 还在列表里
+
+        // 没有陈旧项时不弹确认框。
+        let (mut clean_app, clean_dir) = app_with_config_dir("cleanup-none");
+        clean_app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(clean_app.mode, Mode::List);
+        assert!(
+            clean_app
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no stale")
+        );
+        let _ = std::fs::remove_dir_all(&clean_dir);
+
+        // 有陈旧项：确认框（默认焦点取消）→ y 确认 → 只删陈旧项。
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.mode, Mode::Confirm);
+        let confirm = app.confirm.as_ref().unwrap();
+        assert_eq!(confirm.kind, ActionKind::Cleanup);
+        assert!(!confirm.focus_yes);
+
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.mode, Mode::List);
+        assert!(!app.config.sessions.contains_key("gone-task"));
+        assert!(
+            app.config.sessions.contains_key("legacy"),
+            "live entry kept"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alias_edit_updates_metadata_and_survives_escalation() {
+        let (mut app, dir) = app_with_config_dir("alias");
+        app.selected = 0; // dep
+
+        // 详情弹层里 a → 别名编辑。
+        app.on_key(key(KeyCode::Char('i')));
+        assert_eq!(app.mode, Mode::Detail);
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.mode, Mode::MetaEdit);
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Enter));
+
+        let entry = app.config.sessions.get("dep").unwrap();
+        assert_eq!(entry.alias.as_deref(), Some("x"));
+        assert!(dir.join("config.json").exists(), "config persisted");
+
+        // t → 描述；空值 = 清除。
+        app.on_key(key(KeyCode::Char('i')));
+        app.on_key(key(KeyCode::Char('t')));
+        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.config.sessions.get("dep").unwrap().note.as_deref(),
+            Some("y")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

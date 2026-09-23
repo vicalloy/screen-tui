@@ -17,12 +17,15 @@ pub fn render_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
             " nothing selected".to_string(),
             Style::default(),
         ))],
-        Some(session) => {
-            crate::ui::layout::detail_lines(session, app.meta.as_ref(), app.window_count)
-                .into_iter()
-                .map(Line::from)
-                .collect()
-        }
+        Some(session) => crate::ui::layout::detail_lines(
+            session,
+            app.meta.as_ref(),
+            app.window_count,
+            app.config.sessions.get(&session.name),
+        )
+        .into_iter()
+        .map(Line::from)
+        .collect(),
     };
     f.render_widget(
         Paragraph::new(lines).block(

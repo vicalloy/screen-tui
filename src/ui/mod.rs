@@ -171,7 +171,43 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
             render_filter_input(f, app);
         }
         Mode::Preview => preview::render_overlay(f, app),
+        Mode::MetaEdit => {
+            render_list_screen(f, app);
+            if let Some(edit) = &app.meta_edit {
+                render_meta_edit(f, edit);
+            }
+        }
     }
+}
+
+/// 别名/描述输入弹层（T2.6 / FR-24）。
+fn render_meta_edit(f: &mut Frame<'_>, edit: &crate::app::MetaEdit) {
+    let mut lines = vec![
+        Line::from(format!(" {} for '{}':", edit.field.key(), edit.session)),
+        Line::from(Span::styled(
+            format!(" {}", edit.value),
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if let Some(error) = &edit.error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(ratatui::style::Color::Red),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter save · empty clears · Esc cancel",
+        theme::dimmed(),
+    )));
+
+    let height = lines.len() as u16 + 2;
+    let area = centered_rect(f.area(), 52, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Metadata ")),
+        area,
+    );
 }
 
 /// `/` 过滤输入框（FR-16）：输入即筛，底下列表实时收缩。
@@ -393,7 +429,7 @@ fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout
                 theme::dimmed(),
             )];
             let mut second = vec![Span::styled(
-                " / filter  D detach  K kill  r rename  W wipe(dead)  ? help  q quit".to_string(),
+                " / filter  D detach  K kill  r rename  W wipe(dead)  s restart  X cleanup  ? help  q quit".to_string(),
                 theme::dimmed(),
             )];
             let mut info = format!(" refresh every {}s", app.refresh_interval.as_secs());
@@ -499,6 +535,7 @@ fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
             help_desc("        quick attach by row"),
         ]),
         Line::from(vec![help_key("x"), help_desc("        share attach (-x)")]),
+        Line::from(vec![help_key("p"), help_desc("        preview snapshot")]),
         Line::from(vec![help_key("n"), help_desc("        new session")]),
         Line::from(vec![
             help_key("i"),
@@ -541,7 +578,12 @@ fn render_detail_overlay(f: &mut Frame<'_>, app: &App) {
     let Some(session) = visible.get(app.selected) else {
         return; // 无会话时列表层已给空态，弹层不画。
     };
-    let lines = detail::detail_lines(session, app.meta.as_ref(), app.window_count);
+    let lines = detail::detail_lines(
+        session,
+        app.meta.as_ref(),
+        app.window_count,
+        app.config.sessions.get(&session.name),
+    );
     let height = lines.len() as u16 + 2; // + 边框
     // 用显示宽度算盒宽：CJK 名字 chars().count() 会低估列数导致折行（NFR-06）。
     let width = lines
@@ -551,7 +593,13 @@ fn render_detail_overlay(f: &mut Frame<'_>, app: &App) {
         .unwrap_or(20)
         + 2;
     let area = centered_rect(f.area(), width, height);
-    let text: Vec<Line<'static>> = lines.into_iter().map(Line::from).collect();
+    let mut text: Vec<Line<'static>> = lines.into_iter().map(Line::from).collect();
+    // 元数据编辑入口提示（T2.6 / FR-24）。
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        " a alias · t note · Esc close",
+        theme::dimmed(),
+    )));
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(text).block(Block::bordered().title(" Detail ")),

@@ -48,12 +48,14 @@ fn created_display(created: &str) -> String {
 }
 
 /// 装配一行。`name_budget` 由调用方按宽度算好；此处不做溢出保护之外的布局决策。
+/// `alias` 是 T2.6 的自定义别名（宽/中屏显示，窄屏随信息分级隐藏）。
 fn row_line(
     idx: usize,
     session: &SessionRecord,
     selected: bool,
     name_budget: usize,
     cols: RowCols,
+    alias: Option<&str>,
 ) -> Line<'static> {
     let base: Style = if selected {
         theme::selected_row()
@@ -77,7 +79,12 @@ fn row_line(
     ];
 
     // 名字：控制字符消毒 → 按显示宽度裁剪 → 补齐到预算（对齐右侧各列）。
-    let name = clip_with_ellipsis(&sanitize(&session.name), name_budget);
+    // 别名跟在名字后面（同一名字预算内截断，绝不挤占序号与状态列）。
+    let name = match alias {
+        Some(a) if !a.is_empty() => format!("{} · {}", sanitize(&session.name), sanitize(a)),
+        _ => sanitize(&session.name),
+    };
+    let name = clip_with_ellipsis(&name, name_budget);
     spans.push(Span::raw(pad_right(&name, name_budget)));
 
     if cols.status_text {
@@ -126,10 +133,22 @@ pub fn render(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, tier: Tier) {
 
     let cols = RowCols::for_tier(tier);
     let budget = name_budget(area.width, cols);
+    // 别名只在宽/中屏暴露（FR-05 信息分级；窄屏名字空间太宝贵）。
+    let show_alias = tier == Tier::Wide || tier == Tier::Mid;
     let lines: Vec<Line<'static>> = sessions
         .iter()
         .enumerate()
-        .map(|(idx, session)| row_line(idx, session, idx == app.selected, budget, cols))
+        .map(|(idx, session)| {
+            let alias = if show_alias {
+                app.config
+                    .sessions
+                    .get(&session.name)
+                    .and_then(|m| m.alias.as_deref())
+            } else {
+                None
+            };
+            row_line(idx, session, idx == app.selected, budget, cols, alias)
+        })
         .collect();
     f.render_widget(Paragraph::new(lines), area);
 }

@@ -103,6 +103,7 @@ pub fn detail_lines(
     session: &SessionRecord,
     meta: Option<&crate::screen::probe::Meta>,
     windows: Option<usize>,
+    user_meta: Option<&crate::config::SessionMeta>,
 ) -> Vec<String> {
     let mut lines = vec![format!("name      {}", session.name)];
     lines.push(format!("address   {}", session.full));
@@ -122,6 +123,17 @@ pub fn detail_lines(
         }
         if let Some(command) = &meta.command {
             lines.push(format!("command   {command}"));
+        }
+    }
+    if let Some(user) = user_meta {
+        if let Some(alias) = &user.alias {
+            lines.push(format!("alias     {alias}"));
+        }
+        if let Some(note) = &user.note {
+            lines.push(format!("note      {note}"));
+        }
+        if user.managed {
+            lines.push("managed   yes (created by stui; restart with s)".to_string());
         }
     }
     lines
@@ -173,7 +185,7 @@ mod tests {
             created: Some("08/09/2026 10:23:45 AM".into()),
             status: crate::screen::parse::Status::Detached,
         };
-        let lines = detail_lines(&full, None, None);
+        let lines = detail_lines(&full, None, None, None);
         assert!(lines.iter().any(|l| l.contains("created")));
         // 探测结果缺失时 cwd / command 两行整体不出现（C-5）。
         assert!(!lines.iter().any(|l| l.starts_with("cwd")));
@@ -185,10 +197,19 @@ mod tests {
             cwd: Some("/srv/app".into()),
             command: Some("claude".into()),
         };
-        let lines = detail_lines(&full, Some(&meta), Some(3));
+        let user = crate::config::SessionMeta {
+            alias: Some("登录修复".into()),
+            note: Some("claude 任务".into()),
+            managed: true,
+            ..Default::default()
+        };
+        let lines = detail_lines(&full, Some(&meta), Some(3), Some(&user));
         assert!(lines.iter().any(|l| *l == "cwd       /srv/app"));
         assert!(lines.iter().any(|l| *l == "command   claude"));
         assert!(lines.iter().any(|l| *l == "windows   3"));
+        assert!(lines.iter().any(|l| *l == "alias     登录修复"));
+        assert!(lines.iter().any(|l| *l == "note      claude 任务"));
+        assert!(lines.iter().any(|l| l.starts_with("managed")));
 
         let bare = SessionRecord {
             full: "67890.llm".into(),
@@ -197,7 +218,7 @@ mod tests {
             created: None,
             status: crate::screen::parse::Status::Attached,
         };
-        let lines = detail_lines(&bare, None, None);
+        let lines = detail_lines(&bare, None, None, None);
         assert!(!lines.iter().any(|l| l.starts_with("pid")));
         assert!(!lines.iter().any(|l| l.starts_with("created")));
     }
