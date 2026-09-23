@@ -42,6 +42,8 @@ pub enum Mode {
     Confirm,
     /// `r` 重命名输入（FR-14）。
     Rename,
+    /// `/` 过滤输入（FR-16）。查询词存在 `App::filter`，离开输入态后仍生效。
+    Filter,
 }
 
 /// 向导步骤：名 → 目录 → 命令，每步回车即接受默认值（FR-02 验收 1）。
@@ -300,6 +302,15 @@ pub fn unambiguous_target(sessions: &[SessionRecord], name: &str) -> String {
     }
 }
 
+/// `-Q windows` 输出 → 窗口数（FR-17，纯函数）。
+///
+/// 输出每行一个窗口（`0$ bash` / `1$* zsh` 形态），数非空行即可；
+/// 4.00.03 的 usage dump 每行也有内容，但那条路径根本到不了这里
+/// —— 调用方只在 `caps.query == Yes` 时查询。
+pub fn parse_window_count(text: &str) -> usize {
+    text.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
 pub struct App {
     pub caps: Caps,
     /// 用户配置（T2.1）：刷新间隔、布局阈值、escape 前缀覆盖等。
@@ -325,6 +336,13 @@ pub struct App {
     pub rename: Option<RenameDraft>,
     /// 探测到的 escape 前缀（FR-18）；`None` = 未探测到，提示回退默认。
     pub escape_prefix: Option<String>,
+    /// 过滤查询词（FR-16）。空串 = 不过滤；refresh 不重置它。
+    pub filter: String,
+    /// 选中会话的窗口数（`-Q windows`，FR-17）。能力不可用/未知时恒为 `None` → UI 隐藏。
+    pub window_count: Option<usize>,
+    /// 会话枚举器（NFR-10 可测性）：生产用 [`parse::enumerate`]，
+    /// 测试注入替身 —— 与 M1 的 `plan_connect` 注入风格一致，但覆盖所有调用点。
+    enumerate: fn() -> crate::screen::Result<Enumeration>,
     /// 待事件循环消费的**动作**请求（已过确认框）。
     action_request: Option<ConfirmAction>,
     /// 待事件循环消费的重命名请求。
@@ -358,6 +376,9 @@ impl App {
             confirm: None,
             rename: None,
             escape_prefix: None,
+            filter: String::new(),
+            window_count: None,
+            enumerate: parse::enumerate,
             action_request: None,
             rename_request: None,
             attach_request: None,
@@ -367,12 +388,88 @@ impl App {
         }
     }
 
-    /// 会话切片（渲染层专用；无枚举结果时为空）。
-    pub fn sessions(&self) -> &[SessionRecord] {
+    /// 可见会话（渲染层与选中语义统一走这里；FR-16 过滤生效后的子集）。
+    ///
+    /// 过滤匹配（大小写不敏感的子串）：会话名 / PID 恒参与；
+    /// 运行命令与工作目录在探测缓存里有就参与（进入过滤模式时一次性补齐缓存，
+    /// 之后按缓存匹配 —— 不为过滤在每次 refresh 里对全部会话各起一个 lsof）。
+    pub fn sessions(&self) -> Vec<SessionRecord> {
+        self.all_sessions()
+            .iter()
+            .filter(|s| self.matches_filter(s))
+            .cloned()
+            .collect()
+    }
+
+    /// 全量会话（不过滤）。
+    pub fn all_sessions(&self) -> &[SessionRecord] {
         self.enumeration
             .as_ref()
             .map(|e| e.list.sessions.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// 过滤匹配（纯读：meta 只查缓存，不触发探测）。
+    fn matches_filter(&self, session: &SessionRecord) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let q = self.filter.to_lowercase();
+        if session.name.to_lowercase().contains(&q)
+            || session
+                .pid
+                .map(|p| p.to_string().contains(&q))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Some(pid) = session.pid
+            && let Ok(pid) = u32::try_from(pid)
+            && let Some(meta) = self.meta_cache.peek(pid)
+            && (meta
+                .command
+                .as_deref()
+                .map(|c| c.to_lowercase().contains(&q))
+                .unwrap_or(false)
+                || meta
+                    .cwd
+                    .as_deref()
+                    .map(|c| c.to_lowercase().contains(&q))
+                    .unwrap_or(false))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// `/` 进入过滤：先把全部会话的元数据补进缓存（一次性，输入即筛的前提）。
+    fn open_filter(&mut self) {
+        let pids: Vec<u32> = self
+            .all_sessions()
+            .iter()
+            .filter_map(|s| s.pid.and_then(|p| u32::try_from(p).ok()))
+            .collect();
+        for pid in pids {
+            self.meta_cache.get(pid);
+        }
+        self.mode = Mode::Filter;
+    }
+
+    fn on_key_filter(&mut self, code: KeyCode) {
+        match code {
+            // Esc 清空并退出（FR-16 验收）；Enter 保留查询词回列表。
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.mode = Mode::List;
+            }
+            KeyCode::Enter => self.mode = Mode::List,
+            KeyCode::Backspace => {
+                self.filter.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => self.filter.push(c),
+            _ => {}
+        }
+        self.clamp_selection();
     }
 
     /// 存入一次枚举结果：不闪屏、不丢选中项、不 reset 其它状态（FR-19 验收 2）。
@@ -385,7 +482,7 @@ impl App {
     ///
     /// 失败**保留旧列表**并在页脚给出原因：刷新失败不该把上一帧的真相擦掉。
     pub fn refresh(&mut self) {
-        match parse::enumerate() {
+        match (self.enumerate)() {
             Ok(enumeration) => {
                 self.apply_enumeration(enumeration);
                 self.status = None;
@@ -401,12 +498,62 @@ impl App {
     /// 重新探测选中会话的元数据（T2.2）。探测失败只影响展示字段，不影响主流程。
     fn refresh_meta(&mut self) {
         self.meta = None;
+        self.window_count = None;
+        // 窗口数（FR-17）：仅当 `-Q` 实测可用（Support::Yes）才查询；
+        // Unknown / No 一律隐藏 —— 显示「0」就是编造（C-5）。
+        if self.caps.query.usable()
+            && let Some(session) = self.sessions().get(self.selected)
+        {
+            let full = session.full.clone();
+            if let Ok(run) = cmd::run(["-S", &full, "-Q", "windows"]) {
+                self.window_count = Some(parse_window_count(&run.text()));
+            }
+        }
         if let Some(session) = self.sessions().get(self.selected)
             && let Some(pid) = session.pid
             && let Ok(pid) = u32::try_from(pid)
         {
             self.meta_cache.invalidate(pid);
             self.meta = self.meta_cache.get(pid).cloned();
+        }
+    }
+
+    /// 显式共享连接（FR-10 / `x` 键）：重新校验后直接以 `-x` 进入，
+    /// 不弹冲突选择框 —— 共享不踢人，任何可连接状态都安全。
+    fn start_share(&mut self) {
+        if self.sessions().is_empty() {
+            return;
+        }
+        match (self.enumerate)() {
+            Ok(fresh) => {
+                let Some(name) = self.sessions().get(self.selected).map(|s| s.name.clone()) else {
+                    return;
+                };
+                let status = fresh
+                    .list
+                    .sessions
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.status.clone());
+                self.apply_enumeration(fresh);
+                match status {
+                    Some(Status::Dead | Status::Unreachable) => {
+                        self.status = Some(format!("'{name}' is not connectable; cannot share"));
+                    }
+                    Some(Status::Unknown(raw)) => {
+                        self.status = Some(format!(
+                            "'{name}' reports unknown state '{raw}'; refusing to connect"
+                        ));
+                    }
+                    Some(_) => self.request_attach(AttachKind::Share, name),
+                    None => {
+                        self.status = Some(format!("session '{name}' is gone; list refreshed"));
+                    }
+                }
+            }
+            Err(err) => {
+                self.status = Some(format!("cannot verify sessions before connecting: {err}"));
+            }
         }
     }
 
@@ -460,6 +607,7 @@ impl App {
             Mode::AttachChoice => self.on_key_attach_choice(key.code),
             Mode::Confirm => self.on_key_confirm(key.code),
             Mode::Rename => self.on_key_rename(key.code),
+            Mode::Filter => self.on_key_filter(key.code),
         }
     }
 
@@ -472,6 +620,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             // 手动刷新重置自动轮询计时（refresh() 内统一更新 last_refresh）。
             KeyCode::Char('R') => self.refresh(),
+            // 过滤（FR-16）：输入即筛，Esc 清空。
+            KeyCode::Char('/') => self.open_filter(),
             // 详情弹层：仅在有会话时可开（无会话保持列表空态）。
             KeyCode::Char('i') => {
                 if !self.sessions().is_empty() {
@@ -483,7 +633,17 @@ impl App {
             KeyCode::Char('K') => self.open_confirm(ActionKind::Kill),
             KeyCode::Char('W') => self.open_confirm(ActionKind::Wipe),
             KeyCode::Char('r') => self.open_rename(),
+            // 显式共享连接（FR-10）：任何可连接会话都可以 `-x` 进入。
+            KeyCode::Char('x') => self.start_share(),
             KeyCode::Char('n') => self.open_new_session(),
+            // 数字键 1–9 直连对应序号（§6.4 核心键）。
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let index = (c as u8 - b'1') as usize;
+                if index < self.sessions().len() {
+                    self.selected = index;
+                    self.start_connect();
+                }
+            }
             // 连接选中会话：连接前重校验（1.5a / NFR-08），不以列表旧状态为准。
             KeyCode::Enter => self.start_connect(),
             _ => {}
@@ -497,7 +657,7 @@ impl App {
         if self.sessions().is_empty() {
             return;
         }
-        match parse::enumerate() {
+        match (self.enumerate)() {
             Ok(fresh) => self.plan_connect(fresh),
             Err(err) => {
                 self.status = Some(format!("cannot verify sessions before connecting: {err}"));
@@ -588,7 +748,7 @@ impl App {
 
     /// 产出连接请求（歧义名在此时解析为 full name）。
     fn request_attach(&mut self, kind: AttachKind, name: String) {
-        let sessions: Vec<SessionRecord> = self.sessions().to_vec();
+        let sessions: Vec<SessionRecord> = self.sessions();
         let target = unambiguous_target(&sessions, &name);
         self.attach_request = Some(AttachRequest { kind, target });
     }
@@ -634,7 +794,8 @@ impl App {
                 });
             }
             ActionKind::Detach | ActionKind::Kill => {
-                let Some(session) = self.sessions().get(self.selected) else {
+                let visible = self.sessions();
+                let Some(session) = visible.get(self.selected) else {
                     return;
                 };
                 if kind == ActionKind::Detach
@@ -766,7 +927,8 @@ impl App {
     // ------------------------------------------------------------- 重命名（T2.4 / FR-14）
 
     fn open_rename(&mut self) {
-        let Some(session) = self.sessions().get(self.selected) else {
+        let visible = self.sessions();
+        let Some(session) = visible.get(self.selected) else {
             return;
         };
         self.rename = Some(RenameDraft {
@@ -1125,7 +1287,7 @@ fn event_loop(
 
         // 危险动作（T2.4）：确认框通过后，**执行前**拿新鲜枚举重校验（NFR-08）。
         if let Some(action) = app.take_action() {
-            let validation = match parse::enumerate() {
+            let validation = match (app.enumerate)() {
                 Ok(fresh) => app.validate_action(fresh, &action),
                 Err(err) => Err(format!(
                     "cannot verify sessions before {}: {err}",
@@ -1886,6 +2048,119 @@ mod tests {
         let status = app.status.as_deref().unwrap_or_default();
         assert!(status.contains("kill"), "{status}");
         assert!(status.contains("exit 1"), "{status}");
+    }
+
+    // ------------------------------------------------------------- T2.5 过滤 / 数字直连 / 详情增强
+
+    /// 替身枚举器：返回与 `enumeration(FOUR)` 相同的固定结果（不跑真实 screen）。
+    fn fake_enumerate() -> crate::screen::Result<Enumeration> {
+        Ok(enumeration(FOUR))
+    }
+
+    #[test]
+    fn digits_attach_the_row_they_index() {
+        let mut app = app_with(FOUR); // 排序后：dep / legacy / llm / work
+        app.enumerate = fake_enumerate;
+
+        app.on_key(key(KeyCode::Char('2'))); // 第 2 行 = legacy（dead）→ 拒连
+        assert!(app.take_attach_request().is_none());
+
+        app.on_key(key(KeyCode::Char('3'))); // 第 3 行 = llm（attached）→ 选择框
+        assert_eq!(app.mode, Mode::AttachChoice);
+        app.on_key(key(KeyCode::Char('2'))); // 接管
+        let request = app.take_attach_request().unwrap();
+        assert_eq!(request.target, "llm");
+
+        // 越界数字（> 会话数）无事发生。
+        app.on_key(key(KeyCode::Char('9')));
+        assert!(app.take_attach_request().is_none());
+    }
+
+    #[test]
+    fn x_shares_directly_without_the_conflict_choice() {
+        let mut app = app_with(FOUR);
+        app.enumerate = fake_enumerate;
+        app.selected = 2; // llm（attached）
+        app.on_key(key(KeyCode::Char('x')));
+        let request = app.take_attach_request().expect("share request");
+        assert_eq!(request.kind, AttachKind::Share);
+        assert_eq!(request.target, "llm");
+
+        // dead 会话拒绝共享。
+        let mut app = app_with(FOUR);
+        app.enumerate = fake_enumerate;
+        app.selected = 1; // legacy（dead）
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.take_attach_request().is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not connectable")
+        );
+    }
+
+    #[test]
+    fn filter_narrows_and_survives_refresh() {
+        let mut app = app_with(FOUR); // dep / legacy / llm / work
+        app.enumerate = fake_enumerate;
+
+        app.on_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Filter);
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('l')));
+        // 输入即筛：只剩 llm。
+        assert_eq!(app.sessions().len(), 1);
+        assert_eq!(app.sessions()[0].name, "llm");
+        assert_eq!(app.mode, Mode::Filter);
+
+        // 回列表：查询词仍生效（过滤不因离开输入态而重置）。
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::List);
+        assert_eq!(app.sessions().len(), 1);
+
+        // refresh 不重置过滤（FR-19 验收 2 延伸）。
+        app.refresh();
+        assert_eq!(app.filter, "ll");
+        assert_eq!(app.sessions().len(), 1);
+
+        // Esc 清空并回全量。
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.filter, "");
+        assert_eq!(app.sessions().len(), 4);
+    }
+
+    #[test]
+    fn filter_matches_pid_and_case_insensitively() {
+        let mut app = app_with(FOUR);
+        app.filter = "WORK".into();
+        let visible = app.sessions();
+        let names: Vec<&str> = visible.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["work"]);
+
+        // 按pid：12347 是 dep。
+        app.filter = "12347".into();
+        let visible = app.sessions();
+        let names: Vec<&str> = visible.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["dep"]);
+    }
+
+    #[test]
+    fn window_count_is_parsed_from_q_output() {
+        assert_eq!(parse_window_count("0$ bash\n1$* zsh\n"), 2);
+        assert_eq!(parse_window_count("0$ bash\n\n  \n"), 1);
+        assert_eq!(parse_window_count(""), 0);
+    }
+
+    #[test]
+    fn window_count_stays_hidden_unless_query_support_is_proven() {
+        // caps.query = Unknown（默认）：refresh 不得发出 -Q 查询，窗口数保持 None。
+        // 这里不跑真实 screen —— 直接断言「未探测到就没有值」的不变式。
+        let mut app = app_with(FOUR);
+        app.refresh_meta();
+        assert!(app.window_count.is_none());
+        assert!(!app.caps.query.usable(), "default caps must stay Unknown");
     }
 
     #[test]

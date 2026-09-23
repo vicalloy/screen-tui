@@ -165,7 +165,39 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
                 render_rename(f, draft);
             }
         }
+        Mode::Filter => {
+            render_list_screen(f, app);
+            render_filter_input(f, app);
+        }
     }
+}
+
+/// `/` 过滤输入框（FR-16）：输入即筛，底下列表实时收缩。
+fn render_filter_input(f: &mut Frame<'_>, app: &App) {
+    let visible = app.sessions().len();
+    let total = app.all_sessions().len();
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" /{}", app.filter),
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" {visible} of {total} sessions match"),
+            theme::dimmed(),
+        )),
+        Line::from(Span::styled(
+            " Enter apply · Esc clear filter",
+            theme::dimmed(),
+        )),
+    ];
+    let height = lines.len() as u16 + 2;
+    let area = centered_rect(f.area(), 40, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Filter ")),
+        area,
+    );
 }
 
 /// 危险操作确认框（FR-13）：显示会话名 + 探测到的运行命令，
@@ -346,30 +378,32 @@ fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout
         .iter()
         .any(|s| matches!(s.status, crate::screen::parse::Status::Dead));
 
-    let rows: Vec<Line<'static>> = match tier {
+    let mut rows: Vec<Line<'static>> = match tier {
         // 宽屏：2 行完整快捷键（FR-04）。
         Tier::Wide => {
             let mut first = vec![Span::styled(
-                " j/k move  i detail  R refresh  ? help  q quit".to_string(),
+                " j/k move  Enter attach  1-9 quick  n new  x share  i detail  R refresh"
+                    .to_string(),
                 theme::dimmed(),
             )];
-            if has_dead {
-                // `W` 在 M1 只给「未实现」回执，T2.4 落地（FR-01 验收 2）。
-                first.push(Span::styled("  W wipe dead", theme::dimmed()));
-            }
             let mut second = vec![Span::styled(
-                format!(" refresh every {}s", app.refresh_interval.as_secs()),
+                " / filter  D detach  K kill  r rename  W wipe(dead)  ? help  q quit".to_string(),
                 theme::dimmed(),
             )];
+            let mut info = format!(" refresh every {}s", app.refresh_interval.as_secs());
             if let Some(dir) = app.socket_dir() {
-                second.push(Span::styled(format!(" · socket {dir}"), theme::dimmed()));
+                info.push_str(&format!(" · socket {dir}"));
+            }
+            second.push(Span::styled(info, theme::dimmed()));
+            if has_dead {
+                first.push(Span::styled("  W wipe dead", theme::dimmed()));
             }
             vec![Line::from(first), Line::from(second)]
         }
         // 中屏 / 窄屏：1 行精简。
         Tier::Mid | Tier::Narrow => {
             let mut spans = vec![Span::styled(
-                " j/k move  n new  i detail  ? help  q quit".to_string(),
+                " n new  1-9 attach  i detail  / find  K kill  ? help  q quit".to_string(),
                 theme::dimmed(),
             )];
             if has_dead && tier == Tier::Mid {
@@ -383,6 +417,22 @@ fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout
             theme::dimmed(),
         )])],
     };
+
+    // 过滤状态常驻可见（FR-16 验收）：查询词非空时在页脚行首给出。
+    if !app.filter.is_empty() {
+        let indicator = Span::styled(
+            format!(
+                " /{} {}/{}",
+                app.filter,
+                app.sessions().len(),
+                app.all_sessions().len()
+            ),
+            Style::default().fg(ratatui::style::Color::Cyan),
+        );
+        if let Some(first) = rows.first_mut() {
+            first.spans.insert(0, indicator);
+        }
+    }
 
     f.render_widget(Paragraph::new(rows), area);
 }
@@ -434,15 +484,29 @@ fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
     // 先画底层列表，再叠弹层 —— 视觉上有上下文。
     render_list_screen(f, app);
 
-    let area = centered_rect(f.area(), 46, 9);
+    let area = centered_rect(f.area(), 52, 15);
     let lines = vec![
         Line::from(vec![help_key("j/k / ↑/↓"), help_desc(" move selection")]),
+        Line::from(vec![help_key("Enter"), help_desc("     attach selected")]),
+        Line::from(vec![
+            help_key("1-9"),
+            help_desc("        quick attach by row"),
+        ]),
+        Line::from(vec![help_key("x"), help_desc("        share attach (-x)")]),
+        Line::from(vec![help_key("n"), help_desc("        new session")]),
         Line::from(vec![
             help_key("i"),
             help_desc("        detail of selection"),
         ]),
+        Line::from(vec![help_key("/"), help_desc("        filter sessions")]),
+        Line::from(vec![help_key("D"), help_desc("        remote detach")]),
+        Line::from(vec![help_key("K"), help_desc("        kill (confirm)")]),
+        Line::from(vec![help_key("r"), help_desc("        rename")]),
+        Line::from(vec![
+            help_key("W"),
+            help_desc("        wipe dead (confirm)"),
+        ]),
         Line::from(vec![help_key("R"), help_desc("        refresh now")]),
-        Line::from(vec![help_key("?"), help_desc("        this help")]),
         Line::from(vec![help_key("q / Esc"), help_desc("  quit / close")]),
         Line::from(""),
         Line::from(Span::styled(
@@ -467,10 +531,11 @@ fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
 fn render_detail_overlay(f: &mut Frame<'_>, app: &App) {
     render_list_screen(f, app);
 
-    let Some(session) = app.sessions().get(app.selected) else {
+    let visible = app.sessions();
+    let Some(session) = visible.get(app.selected) else {
         return; // 无会话时列表层已给空态，弹层不画。
     };
-    let lines = detail::detail_lines(session, app.meta.as_ref());
+    let lines = detail::detail_lines(session, app.meta.as_ref(), app.window_count);
     let height = lines.len() as u16 + 2; // + 边框
     // 用显示宽度算盒宽：CJK 名字 chars().count() 会低估列数导致折行（NFR-06）。
     let width = lines
@@ -687,7 +752,10 @@ mod tests {
         let terminal = draw(&app, 80, 20);
         let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
         assert!(all.contains(" Detail "), "mid shows detail area");
-        assert!(all.contains("j/k move"), "mid footer is one line of hints");
+        assert!(
+            all.contains("1-9 attach"),
+            "mid footer is one line of hints"
+        );
     }
 
     #[test]

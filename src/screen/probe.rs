@@ -188,6 +188,11 @@ impl MetaCache {
         self.entries.get(&pid)
     }
 
+    /// 只读窥视（不触发探测）：过滤匹配等纯读路径用。
+    pub fn peek(&self, pid: u32) -> Option<&Meta> {
+        self.entries.get(&pid)
+    }
+
     /// 作废单个 pid 的缓存（NFR-08 的精神：详情里的 cwd/command 不该是陈旧的）。
     pub fn invalidate(&mut self, pid: u32) {
         self.entries.remove(&pid);

@@ -97,10 +97,12 @@ impl RowCols {
 /// 一条会话在给定档位下可展示的全部字段（详情面板与 `i` 弹层共用）。
 ///
 /// 取不到的字段直接不出现该行 —— 显示「无」就是编造（C-5）。
-/// `meta` 是 T2.2 的探测结果（cwd / command），`None` 时两行都不出现。
+/// `meta` 是 T2.2 的探测结果（cwd / command），`None` 时两行都不出现；
+/// `windows` 是 `-Q windows` 结果（FR-17），能力不可用时调用方传 `None`，该行隐藏。
 pub fn detail_lines(
     session: &SessionRecord,
     meta: Option<&crate::screen::probe::Meta>,
+    windows: Option<usize>,
 ) -> Vec<String> {
     let mut lines = vec![format!("name      {}", session.name)];
     lines.push(format!("address   {}", session.full));
@@ -110,6 +112,9 @@ pub fn detail_lines(
     lines.push(format!("status    {}", session.status.label()));
     if let Some(created) = &session.created {
         lines.push(format!("created   {created}"));
+    }
+    if let Some(windows) = windows {
+        lines.push(format!("windows   {windows}"));
     }
     if let Some(meta) = meta {
         if let Some(cwd) = &meta.cwd {
@@ -168,19 +173,22 @@ mod tests {
             created: Some("08/09/2026 10:23:45 AM".into()),
             status: crate::screen::parse::Status::Detached,
         };
-        let lines = detail_lines(&full, None);
+        let lines = detail_lines(&full, None, None);
         assert!(lines.iter().any(|l| l.contains("created")));
         // 探测结果缺失时 cwd / command 两行整体不出现（C-5）。
         assert!(!lines.iter().any(|l| l.starts_with("cwd")));
         assert!(!lines.iter().any(|l| l.starts_with("command")));
+        // 窗口数能力不可用时该行隐藏（FR-17 验收）。
+        assert!(!lines.iter().any(|l| l.starts_with("windows")));
 
         let meta = crate::screen::probe::Meta {
             cwd: Some("/srv/app".into()),
             command: Some("claude".into()),
         };
-        let lines = detail_lines(&full, Some(&meta));
+        let lines = detail_lines(&full, Some(&meta), Some(3));
         assert!(lines.iter().any(|l| *l == "cwd       /srv/app"));
         assert!(lines.iter().any(|l| *l == "command   claude"));
+        assert!(lines.iter().any(|l| *l == "windows   3"));
 
         let bare = SessionRecord {
             full: "67890.llm".into(),
@@ -189,7 +197,7 @@ mod tests {
             created: None,
             status: crate::screen::parse::Status::Attached,
         };
-        let lines = detail_lines(&bare, None);
+        let lines = detail_lines(&bare, None, None);
         assert!(!lines.iter().any(|l| l.starts_with("pid")));
         assert!(!lines.iter().any(|l| l.starts_with("created")));
     }

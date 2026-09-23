@@ -111,7 +111,15 @@ fn row_line(
 pub fn render(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, tier: Tier) {
     let sessions = app.sessions();
     if sessions.is_empty() {
-        let hint = "No screen sessions. Press n to create one.";
+        let hint: String = if app.filter.is_empty() {
+            "No screen sessions. Press n to create one.".into()
+        } else {
+            // 过滤后无命中：给出口（Esc 清空），不误报「没有会话」。
+            format!(
+                "No sessions match '/{}'. Esc clears the filter.",
+                app.filter
+            )
+        };
         f.render_widget(Paragraph::new(hint).style(theme::dimmed()), area);
         return;
     }
