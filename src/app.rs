@@ -86,6 +86,8 @@ pub struct NewDraft {
     pub name: String,
     pub dir: String,
     pub command: String,
+    /// 收藏目录快照（T2.7 / FR-23）：进入目录步时从配置取的最近目录（最多 9 条）。
+    pub recent: Vec<String>,
     pub error: Option<String>,
     pub note: Option<String>,
 }
@@ -862,6 +864,21 @@ impl App {
             .map(|(_, n)| n.to_string())
             .unwrap_or_else(|| request.target.clone());
         self.record_seen(&name);
+        // 收藏目录（T2.7 / FR-23）：连接成功且缓存里已有 cwd 时记录（只读窥视，
+        // 不为记录目录再起一次 lsof —— 取不到就不记，C-5）。
+        let mut cwd_to_record = None;
+        if run.success()
+            && let Some(session) = self.all_sessions().iter().find(|s| s.name == name)
+            && let Some(pid) = session.pid
+            && let Ok(pid) = u32::try_from(pid)
+            && let Some(meta) = self.meta_cache.peek(pid)
+            && let Some(cwd) = &meta.cwd
+        {
+            cwd_to_record = Some(cwd.clone());
+        }
+        if let Some(cwd) = cwd_to_record {
+            self.config.touch_dir(&cwd);
+        }
         self.save_config();
         self.status = Some(if run.success() {
             format!("detached from '{}'", request.target)
@@ -1050,6 +1067,7 @@ impl App {
                 &request.dir.display().to_string(),
                 &request.command,
             );
+            self.config.touch_dir(&request.dir.display().to_string());
             self.save_config();
             self.status = Some(format!(
                 "restarted '{}' with its recorded command",
@@ -1441,19 +1459,46 @@ impl App {
     /// 打开三步向导：预填当前目录、默认名、`$SHELL`（FR-02 验收 1）。
     pub fn open_new_session(&mut self) {
         let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let recent = self.recent_dirs_for_wizard();
         self.draft = Some(NewDraft {
             step: NewStep::Name,
             name: default_session_name(&dir, std::time::SystemTime::now()),
             dir: dir.display().to_string(),
             command: default_command(),
+            recent,
             error: None,
             note: None,
         });
         self.mode = Mode::NewSession;
     }
 
+    /// 向导目录步展示的收藏目录（最多 9 条 —— 数字键 1–9 直选）。
+    fn recent_dirs_for_wizard(&self) -> Vec<String> {
+        self.config
+            .dirs
+            .iter()
+            .take(9)
+            .map(|d| d.path.clone())
+            .collect()
+    }
+
     fn on_key_new(&mut self, code: KeyCode) {
-        let Some(draft) = &mut self.draft else {
+        // 收藏目录数字直选（T2.7 / FR-23）：目录步的 1–9；无效数字落入一般输入。
+        if let Some(draft) = self.draft.as_mut()
+            && draft.step == NewStep::Dir
+            && let KeyCode::Char(c) = code
+            && c.is_ascii_digit()
+            && c != '0'
+        {
+            let index = (c as u8 - b'1') as usize;
+            if let Some(path) = draft.recent.get(index).cloned() {
+                draft.dir = path;
+                self.advance_new();
+                return;
+            }
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
             // 草稿丢失（不应发生）：回到列表而不是卡死。
             self.mode = Mode::List;
             return;
@@ -1496,6 +1541,8 @@ impl App {
                 draft.note = self.duplicate_note(&draft.name);
                 draft.error = None;
                 draft.step = NewStep::Dir;
+                // 目录步展示收藏目录快照（T2.7）。
+                draft.recent = self.recent_dirs_for_wizard();
                 self.draft = Some(draft);
             }
             NewStep::Dir => {
@@ -1577,8 +1624,9 @@ impl App {
             ));
         }
 
-        // 创建成功：记录 managed 元数据（FR-24 验收 1：stui 创建 = 可重启）。
+        // 创建成功：记录 managed 元数据 + 收藏目录（FR-24 / FR-23）。
         self.record_managed(name, dir, command);
+        self.config.touch_dir(dir);
         self.save_config();
 
         // 创建成功后立刻重枚举，把选中项对准新会话（FR-02 验收 5）。
@@ -2877,6 +2925,88 @@ mod tests {
             app.config.sessions.get("dep").unwrap().note.as_deref(),
             Some("y")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------- T2.7 收藏目录
+
+    #[test]
+    fn touch_dir_dedupes_sorts_and_caps() {
+        let mut config = Config::new();
+        config.max_recent_dirs = 3;
+
+        config.touch_dir("/a");
+        config.touch_dir("/b");
+        config.touch_dir("/c");
+        // /a 重复使用 → 提到最前。
+        config.touch_dir("/a");
+        let paths: Vec<&str> = config.dirs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a", "/c", "/b"]);
+
+        // 上限淘汰最旧。
+        config.touch_dir("/d");
+        let paths: Vec<&str> = config.dirs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["/d", "/a", "/c"]);
+    }
+
+    #[test]
+    fn wizard_dir_step_lists_recent_and_digits_pick() {
+        let (mut app, dir) = app_with_config_dir("wizard");
+        let real_dir = dir.display().to_string();
+        // 入库顺序决定展示顺序：最近的在前。
+        app.config.touch_dir(&real_dir);
+        app.config.touch_dir("/nonexistent-for-test");
+
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(key(KeyCode::Enter)); // 名字默认 → 目录步
+        let draft = app.draft.as_ref().unwrap();
+        assert_eq!(draft.step, NewStep::Dir);
+        assert_eq!(
+            draft.recent,
+            vec!["/nonexistent-for-test".to_string(), real_dir.clone()]
+        );
+
+        // 越界数字（> 收藏数）不消费，按普通输入追加到目录字段。
+        app.on_key(key(KeyCode::Char('9')));
+        assert!(app.draft.as_ref().unwrap().dir.ends_with('9'));
+
+        // 数字 2 → 直选 real_dir（存在）并推进到命令步。
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Command);
+        assert_eq!(app.draft.as_ref().unwrap().dir, real_dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_records_cwd_into_recent_dirs() {
+        let (mut app, dir) = app_with_config_dir("attach-dirs");
+        app.enumerate = fake_enumerate; // refresh 用替身，列表不被真实 screen 清空
+        let request = AttachRequest {
+            kind: AttachKind::Resume,
+            target: "12347.dep".into(),
+        };
+        // dep（12347）的 cwd 已在缓存里（此前选中时探测过）；
+        // 选中别的行，避免 refresh_meta 把 12347 的缓存作废。
+        app.selected = 3;
+        app.meta_cache.entries_insert_for_test(
+            12347,
+            probe::Meta {
+                cwd: Some("/srv/dep".into()),
+                command: Some("top".into()),
+            },
+        );
+
+        let ok_run = cmd::Run {
+            command: "screen -U -r 12347.dep".into(),
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        app.note_attach_outcome(&request, &ok_run);
+        let paths: Vec<&str> = app.config.dirs.iter().map(|d| d.path.as_str()).collect();
+        assert!(paths.contains(&"/srv/dep"), "{paths:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

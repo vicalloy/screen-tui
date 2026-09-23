@@ -115,10 +115,17 @@ pub struct Config {
     pub version: u32,
     pub ui: UiConfig,
     pub defaults: Defaults,
+    /// 收藏目录上限（FR-23：可配，默认 10，入满淘汰最旧）。
+    #[serde(default = "default_max_recent_dirs")]
+    pub max_recent_dirs: usize,
     /// 最近使用的目录，**最近的在前**（T2.7 维护）。
     pub dirs: Vec<DirEntry>,
     /// 会话名 → 元数据。
     pub sessions: std::collections::BTreeMap<String, SessionMeta>,
+}
+
+fn default_max_recent_dirs() -> usize {
+    10
 }
 
 impl Default for Config {
@@ -135,9 +142,28 @@ impl Config {
             version: CONFIG_VERSION,
             ui: UiConfig::default(),
             defaults: Defaults::default(),
+            max_recent_dirs: default_max_recent_dirs(),
             dirs: Vec::new(),
             sessions: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// 记录一次目录使用（T2.7 / FR-23）：去重后移到队首，超出上限淘汰最旧。
+    pub fn touch_dir(&mut self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let now = crate::util::time::local_datetime(std::time::SystemTime::now());
+        self.dirs.retain(|d| d.path != path);
+        self.dirs.insert(
+            0,
+            DirEntry {
+                path: path.to_string(),
+                last_used: now,
+            },
+        );
+        let max = self.max_recent_dirs.max(1);
+        self.dirs.truncate(max);
     }
 }
 

@@ -209,6 +209,12 @@ impl MetaCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// 测试注入：绕过探测直接塞缓存。
+    #[cfg(test)]
+    pub fn entries_insert_for_test(&mut self, pid: u32, meta: Meta) {
+        self.entries.insert(pid, meta);
+    }
 }
 
 #[cfg(test)]

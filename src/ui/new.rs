@@ -22,11 +22,29 @@ pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
         .map(|e| e.lines().count())
         .or_else(|| draft.note.as_ref().map(|n| n.lines().count()))
         .unwrap_or(0) as u16;
-    let height = BASE_CONTENT + message_lines + 2; // + 边框
+    // 目录步加收藏列表（T2.7）：标题行 + 每条目录一行。
+    let recent_lines = if draft.step == NewStep::Dir {
+        draft.recent.len() as u16 + 1
+    } else {
+        0
+    };
+    let height = BASE_CONTENT + message_lines + recent_lines + 2; // + 边框
     let area = centered_rect(f.area(), BOX_WIDTH, height);
 
     let mut lines = vec![steps_indicator(draft), Line::from("")];
     lines.push(input_line(draft));
+    if draft.step == NewStep::Dir && !draft.recent.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " Recent (1-9 to pick):".to_string(),
+            theme::dimmed(),
+        )));
+        for (idx, path) in draft.recent.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!("  {} {}", idx + 1, path),
+                theme::dimmed(),
+            )));
+        }
+    }
     match (&draft.error, &draft.note) {
         (Some(error), _) => {
             for line in error.lines() {
