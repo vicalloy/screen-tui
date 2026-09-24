@@ -4,8 +4,9 @@
 //!
 //! 1. **范围**：CLI 输出 + TUI 全部界面文案；screen 适配层的错误串与
 //!    clap 的 help 文本保持英文（技术诊断信息，不在本层）。
-//! 2. **切换**：`config.json` 顶层 `language` 字段（`zh` / `en` / `auto`），
-//!    `auto` 时按 `LC_ALL` > `LC_MESSAGES` > `LANG` 探测，都不含 zh/en 前缀则回退英文。
+//! 2. **切换**：`$STUI_LANG` 覆盖 > `config.json` 顶层 `language` 字段（`zh` / `en` /
+//!    `auto`），`auto` 时按 `LC_ALL` > `LC_MESSAGES` > `LANG` 探测，都不含 zh/en
+//!    前缀则回退英文。
 //! 3. **实现**：手写翻译表 —— 一个 [`Dict`] 结构体装全部文案，
 //!    `EN` / `ZH` 两个常量必须字段齐全（少一个就是编译错误），无任何第三方依赖。
 //!
@@ -22,6 +23,9 @@
 use std::sync::OnceLock;
 
 // ------------------------------------------------------------- 语言
+
+/// 语言覆盖环境变量：设为 `zh` / `en` 等可被 [`Lang::detect`] 识别的值即生效。
+pub const LANG_ENV: &str = "STUI_LANG";
 
 /// 界面语言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +330,7 @@ pub struct Dict {
     pub footer_wipe: &'static str,
     pub footer_tiny: &'static str,
     pub footer_refresh: &'static str,
+    pub footer_manual: &'static str,
 
     // ---- 帮助弹层（ui/mod.rs）
     pub help_title: &'static str,
@@ -574,6 +579,7 @@ const DICT_EN: Dict = Dict {
     footer_wipe: "  W wipe",
     footer_tiny: " ? help  q quit",
     footer_refresh: " refresh every {0}s",
+    footer_manual: " manual refresh (R)",
     help_title: " Help ",
     desc_move: " move selection",
     desc_attach: "     attach selected",
@@ -814,6 +820,7 @@ const DICT_ZH: Dict = Dict {
     footer_wipe: "  W 清理",
     footer_tiny: " ? 帮助  q 退出",
     footer_refresh: " 每 {0}s 刷新",
+    footer_manual: " 手动刷新（R）",
     help_title: " 帮助 ",
     desc_move: " 移动选择",
     desc_attach: "     连接选中会话",

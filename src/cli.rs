@@ -68,12 +68,14 @@ pub struct LsArgs {
 /// 入口：解析参数并分发。
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    // 语言（FR-25）：读配置 `language`（auto 时探测 locale），进程内初始化一次。
-    // 配置读失败/损坏已由 config 层降级为默认值，此处只取语言，不关心 warnings
-    // （TUI 路径的 app::run 会再次加载并展示它们）。
-    crate::i18n::init(crate::i18n::Lang::detect(
-        &crate::config::load().config.language,
-    ));
+    // 语言（FR-25）：`$STUI_LANG` 覆盖 > 配置 `language`（auto 时探测 locale），
+    // 进程内初始化一次。配置读失败/损坏已由 config 层降级为默认值，此处只取语言，
+    // 不关心 warnings（TUI 路径的 app::run 会再次加载并展示它们）。
+    let language = std::env::var(crate::i18n::LANG_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| crate::config::load().config.language);
+    crate::i18n::init(crate::i18n::Lang::detect(&language));
     match cli.command {
         Some(Command::Ls(args)) => ls(&args),
         Some(Command::Doctor) => doctor_command(),

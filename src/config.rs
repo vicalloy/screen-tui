@@ -53,8 +53,6 @@ pub struct UiConfig {
     pub narrow_cols: u16,
     /// 宽屏阈值（≥ 该值开双栏）。
     pub wide_cols: u16,
-    /// 自动刷新间隔毫秒（FR-19 默认 3 秒）。
-    pub refresh_ms: u64,
     /// 状态图标开关（关闭后用文字状态）。
     pub icons: bool,
 }
@@ -65,7 +63,6 @@ impl Default for UiConfig {
             layout: "auto".into(),
             narrow_cols: crate::ui::layout::NARROW_COLS,
             wide_cols: crate::ui::layout::WIDE_COLS,
-            refresh_ms: 3000,
             icons: true,
         }
     }
@@ -406,7 +403,7 @@ mod tests {
     #[test]
     fn roundtrip_preserves_all_sections() {
         let mut config = Config::new();
-        config.ui.refresh_ms = 5000;
+        config.ui.icons = false;
         config.defaults.escape_prefix = Some("C-\\\\".into());
         config.dirs.push(DirEntry {
             path: "/srv/app".into(),
@@ -434,7 +431,6 @@ mod tests {
         // 手写的最小配置：只有 version。其余字段全部走 serde(default)。
         let config: Config = serde_json::from_str(r#"{"version":1}"#).unwrap();
         assert_eq!(config, Config::new());
-        assert_eq!(config.ui.refresh_ms, 3000);
         assert!(config.defaults.escape_prefix.is_none());
     }
 
@@ -444,7 +440,7 @@ mod tests {
         let path = dir.join("config.json");
 
         let mut config = Config::new();
-        config.ui.refresh_ms = 1234;
+        config.ui.icons = false;
         assert!(save_to(&config, Some(&path)).unwrap());
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -457,7 +453,7 @@ mod tests {
         );
 
         let loaded = load_from(Some(&path));
-        assert_eq!(loaded.config.ui.refresh_ms, 1234);
+        assert!(!loaded.config.ui.icons, "values still readable");
         assert!(loaded.warnings.is_empty());
         assert!(!loaded.read_only);
 
@@ -492,7 +488,8 @@ mod tests {
 
         let loaded = load_from(Some(&path));
         assert!(loaded.read_only, "higher version must be read-only");
-        assert_eq!(loaded.config.ui.refresh_ms, 777, "values still readable");
+        // refresh_ms 已废弃：旧配置里的未知字段被忽略，不报错、不进默认值。
+        assert_eq!(loaded.config.ui, UiConfig::default(), "unknown ui fields ignored");
         assert_eq!(loaded.warnings.len(), 1);
         assert!(
             loaded.warnings[0].contains("read-only"),

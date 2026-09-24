@@ -425,10 +425,15 @@ fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout
             let t = crate::i18n::t();
             let mut first = vec![Span::styled(t.footer_wide_1.to_string(), theme::dimmed())];
             let mut second = vec![Span::styled(t.footer_wide_2.to_string(), theme::dimmed())];
-            let mut info = crate::i18n::fmt(
-                t.footer_refresh,
-                &[&app.refresh_interval.as_secs().to_string()],
-            );
+            // 刷新模式提示（FR-19 修订）：自动刷新关（默认）给手动提示，
+            // 开（`$STUI_AUTO_REFRESH`）给当前间隔。
+            let mut info = match app.refresh_interval {
+                Some(interval) => crate::i18n::fmt(
+                    t.footer_refresh,
+                    &[&interval.as_secs().to_string()],
+                ),
+                None => t.footer_manual.to_string(),
+            };
             if let Some(dir) = app.socket_dir() {
                 info.push_str(&format!(" · socket {dir}"));
             }

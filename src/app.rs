@@ -471,7 +471,13 @@ pub struct App {
     /// 过滤查询词（FR-16）。空串 = 不过滤；refresh 不重置它。
     pub filter: String,
     /// 选中会话的窗口数（`-Q windows`，FR-17）。能力不可用/未知时恒为 `None` → UI 隐藏。
+    ///
+    /// 懒获取：详情可见时才查（[`App::ensure_window_count`]），带 10s TTL 缓存 ——
+    /// 详见 [`WindowCountCache`]。
     pub window_count: Option<usize>,
+    /// 窗口数缓存：同一会话 10s 内不重复 `-Q`（FR-17 修订）。失败结果同样入缓存，
+    /// 防止探测失败时每个渲染帧重试成风暴。
+    window_count_cache: Option<WindowCountCache>,
     /// 最近一次成功抓取的预览（T2.3）。仅宽屏右栏与 `p` 弹层消费。
     pub preview: Option<PreviewView>,
     /// 宽屏自动预览的「已抓取目标」—— 同一会话不重复抓，选中项变化才再抓。
@@ -498,8 +504,39 @@ pub struct App {
     /// 待事件循环消费的连接请求（`take_attach_request` 取走后执行前台连接）。
     attach_request: Option<AttachRequest>,
     pub should_quit: bool,
-    pub refresh_interval: Duration,
+    /// 自动刷新间隔；`None` = 纯手动（默认，FR-19 修订）。
+    /// 由 `$STUI_AUTO_REFRESH`（秒）开启，见 [`auto_refresh_interval`]。
+    pub refresh_interval: Option<Duration>,
     last_refresh: Option<Instant>,
+}
+
+/// 窗口数缓存条目（FR-17 修订）。
+#[derive(Debug, Clone)]
+struct WindowCountCache {
+    /// 缓存归属的会话（`-ls` 全名，换会话即失效）。
+    full: String,
+    /// 抓到的窗口数；`None` = 探测失败（同样缓存，避免逐帧重试）。
+    count: Option<usize>,
+    fetched_at: Instant,
+}
+
+/// 窗口数缓存的复用窗口：10s 内刚抓过就用缓存（FR-17 修订）。
+const WINDOW_COUNT_TTL: Duration = Duration::from_secs(10);
+
+/// `$STUI_AUTO_REFRESH`：自动刷新间隔（秒）。
+///
+/// 设为正整数 → 自动刷新；未设置、为 0 或非法值 → 纯手动刷新（默认）。
+pub const AUTO_REFRESH_ENV: &str = "STUI_AUTO_REFRESH";
+
+/// 读取自动刷新配置（纯函数 [`parse_auto_refresh_secs`] 的环境变量入口）。
+fn auto_refresh_interval() -> Option<Duration> {
+    parse_auto_refresh_secs(&std::env::var(AUTO_REFRESH_ENV).unwrap_or_default())
+        .map(Duration::from_secs)
+}
+
+/// 解析 `$STUI_AUTO_REFRESH` 的值（纯函数，供测试）：正整数秒，其余一律 `None`。
+fn parse_auto_refresh_secs(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|secs| *secs > 0)
 }
 
 impl App {
@@ -507,9 +544,9 @@ impl App {
         Self::with_config(caps, Config::default())
     }
 
-    /// 带配置构造（T2.1）：刷新间隔来自配置（FR-19 可配置项），下限 500ms 防忙轮询。
+    /// 带配置构造（T2.1）。自动刷新默认关闭（FR-19 修订），`run()` 入口按
+    /// `$STUI_AUTO_REFRESH` 打开 —— 测试路径不读环境变量，保持确定性。
     pub fn with_config(caps: Caps, config: Config) -> Self {
-        let refresh_interval = Duration::from_millis(config.ui.refresh_ms.max(500));
         Self {
             caps,
             config,
@@ -526,6 +563,7 @@ impl App {
             escape_prefix: None,
             filter: String::new(),
             window_count: None,
+            window_count_cache: None,
             preview: None,
             last_preview_target: None,
             preview_request: None,
@@ -539,7 +577,7 @@ impl App {
             rename_request: None,
             attach_request: None,
             should_quit: false,
-            refresh_interval,
+            refresh_interval: None,
             last_refresh: None,
         }
     }
@@ -548,7 +586,7 @@ impl App {
     ///
     /// 过滤匹配（大小写不敏感的子串）：会话名 / PID 恒参与；
     /// 运行命令与工作目录在探测缓存里有就参与（进入过滤模式时一次性补齐缓存，
-    /// 之后按缓存匹配 —— 不为过滤在每次 refresh 里对全部会话各起一个 lsof）。
+    /// 之后按缓存匹配 —— 不为过滤在每次 refresh 里对全部会话各跑一轮探测）。
     pub fn sessions(&self) -> Vec<SessionRecord> {
         self.all_sessions()
             .iter()
@@ -655,19 +693,13 @@ impl App {
     }
 
     /// 重新探测选中会话的元数据（T2.2）。探测失败只影响展示字段，不影响主流程。
+    ///
+    /// 窗口数不在这里查（FR-17 修订）：改为详情可见时的懒获取（[`App::ensure_window_count`]）。
     fn refresh_meta(&mut self) {
         self.meta = None;
+        // 显示值随 refresh 作废；缓存不动作（懒获取，FR-17 修订），
+        // 下一次 `ensure_window_count` 按缓存新鲜度决定是否重查。
         self.window_count = None;
-        // 窗口数（FR-17）：仅当 `-Q` 实测可用（Support::Yes）才查询；
-        // Unknown / No 一律隐藏 —— 显示「0」就是编造（C-5）。
-        if self.caps.query.usable()
-            && let Some(session) = self.sessions().get(self.selected)
-        {
-            let full = session.full.clone();
-            if let Ok(run) = cmd::run(["-S", &full, "-Q", "windows"]) {
-                self.window_count = Some(parse_window_count(&run.text()));
-            }
-        }
         if let Some(session) = self.sessions().get(self.selected)
             && let Some(pid) = session.pid
             && let Ok(pid) = u32::try_from(pid)
@@ -675,6 +707,57 @@ impl App {
             self.meta_cache.invalidate(pid);
             self.meta = self.meta_cache.get(pid).cloned();
         }
+    }
+
+    /// 窗口数是否需要抓取（纯决策，不 spawn）：详情可见 + 能力可用 + 缓存
+    /// 过期（10s TTL / 换了会话 / 手动刷新已作废）。返回要抓的会话全名。
+    pub fn window_count_due(&self, detail_visible: bool) -> Option<String> {
+        if !detail_visible || !self.caps.query.usable() {
+            return None;
+        }
+        let visible = self.sessions();
+        let session = visible.get(self.selected)?;
+        let full = session.full.clone();
+        if let Some(cache) = &self.window_count_cache
+            && cache.full == full
+            && cache.fetched_at.elapsed() < WINDOW_COUNT_TTL
+        {
+            return None;
+        }
+        Some(full)
+    }
+
+    /// 窗口数懒获取（FR-17 修订）：只在详情展示需要时才 `-Q windows`，
+    /// 同一会话 10s 内复用缓存；失败结果同样入缓存，防止逐帧重试。
+    ///
+    /// 事件循环每轮调用；`detail_visible` 由终端尺寸档位 + 当前模式决定。
+    pub fn ensure_window_count(&mut self, detail_visible: bool) {
+        self.window_count = None;
+        let visible = self.sessions();
+        let Some(session) = visible.get(self.selected) else {
+            return;
+        };
+        let full = session.full.clone();
+        // 缓存新鲜：直接复用，不 spawn。
+        if let Some(cache) = &self.window_count_cache
+            && cache.full == full
+            && cache.fetched_at.elapsed() < WINDOW_COUNT_TTL
+        {
+            self.window_count = cache.count;
+            return;
+        }
+        if self.window_count_due(detail_visible).is_none() {
+            return;
+        }
+        let count = cmd::run(["-S", &full, "-Q", "windows"])
+            .ok()
+            .map(|run| parse_window_count(&run.text()));
+        self.window_count_cache = Some(WindowCountCache {
+            full,
+            count,
+            fetched_at: Instant::now(),
+        });
+        self.window_count = count;
     }
 
     /// 显式共享连接（FR-10 / `x` 键）：重新校验后直接以 `-x` 进入，
@@ -742,17 +825,18 @@ impl App {
         self.selected = next.clamp(0, count as isize - 1) as usize;
     }
 
-    /// 距下次自动刷新的剩余时间；尚未刷新过时返回 0（下一轮立即刷新）。
+    /// 距下次自动刷新的剩余时间；自动刷新关闭或尚未刷新过时返回 `MAX`
+    /// （事件循环会把它钳到 `POLL_CAP`，纯阻塞等待）。
     pub fn next_tick_in(&self) -> Duration {
-        match self.last_refresh {
-            None => Duration::ZERO,
-            Some(at) => self.refresh_interval.saturating_sub(at.elapsed()),
+        match (self.refresh_interval, self.last_refresh) {
+            (Some(interval), Some(at)) => interval.saturating_sub(at.elapsed()),
+            _ => Duration::MAX,
         }
     }
 
-    /// 是否到达自动刷新点。轮询间隔已到且未被手动刷新重置。
+    /// 是否到达自动刷新点。关闭（`refresh_interval == None`）时恒否 —— 手动模型。
     pub fn tick_due(&self) -> bool {
-        self.next_tick_in() == Duration::ZERO && self.last_refresh.is_some()
+        self.next_tick_in().is_zero()
     }
 
     /// socket 目录（`-ls` 尾行提取；未枚举或解析不出时 `None`）。
@@ -787,8 +871,12 @@ impl App {
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            // 手动刷新重置自动轮询计时（refresh() 内统一更新 last_refresh）。
-            KeyCode::Char('R') => self.refresh(),
+            // 手动刷新：窗口数缓存一并作废（FR-17 修订「除非手动刷新」），
+            // 自动轮询计时由 refresh() 内统一更新的 last_refresh 重置。
+            KeyCode::Char('R') => {
+                self.window_count_cache = None;
+                self.refresh();
+            }
             // 过滤（FR-16）：输入即筛，Esc 清空。
             KeyCode::Char('/') => self.open_filter(),
             // 详情弹层：仅在有会话时可开（无会话保持列表空态）。
@@ -948,7 +1036,7 @@ impl App {
             .unwrap_or_else(|| request.target.clone());
         self.record_seen(&name);
         // 收藏目录（T2.7 / FR-23）：连接成功且缓存里已有 cwd 时记录（只读窥视，
-        // 不为记录目录再起一次 lsof —— 取不到就不记，C-5）。
+        // 不为记录目录再跑一轮探测 —— 取不到就不记，C-5）。
         let mut cwd_to_record = None;
         if run.success()
             && let Some(session) = self.all_sessions().iter().find(|s| s.name == name)
@@ -1951,6 +2039,8 @@ pub fn run() -> u8 {
     // escape 前缀（FR-18）：配置显式覆盖 > `.screenrc` 探测 > 默认（None 回退）。
     let explicit_prefix = loaded.config.defaults.escape_prefix.clone();
     let mut app = App::with_config(caps, loaded.config);
+    // 自动刷新（FR-19 修订）：默认纯手动；`$STUI_AUTO_REFRESH=<秒>` 显式开启。
+    app.refresh_interval = auto_refresh_interval();
     app.escape_prefix = match explicit_prefix {
         Some(explicit) => Some(explicit),
         None => detect_escape_prefix(),
@@ -2007,6 +2097,14 @@ fn event_loop(
         if app.tick_due() {
             app.refresh();
         }
+
+        // 窗口数懒获取（FR-17 修订）：详情可见（详情弹层，或 Wide/Mid 档的常驻
+        // 详情面板）时才按 10s TTL 查 `-Q windows`，其余档位不产生任何 spawn。
+        let size = terminal.size()?;
+        let tier = ui::layout::Tier::from_size(size.width, size.height);
+        let detail_visible = app.mode == Mode::Detail
+            || matches!(tier, ui::layout::Tier::Wide | ui::layout::Tier::Mid);
+        app.ensure_window_count(detail_visible);
 
         // 连接请求：suspend → 前台 screen → resume → 强制重绘（1.5d）。
         if let Some(request) = app.take_attach_request() {
@@ -2237,21 +2335,31 @@ mod tests {
     #[test]
     fn tick_scheduling_respects_manual_refresh() {
         let mut app = app_with(FOUR);
-        // 尚未刷新过：下一轮立即刷新。
-        assert_eq!(app.next_tick_in(), Duration::ZERO);
+        // 自动刷新默认关闭（FR-19 修订）：无论是否刷新过都不 tick，纯手动。
+        assert_eq!(app.next_tick_in(), Duration::MAX);
+        assert!(!app.tick_due());
+        app.refresh();
         assert!(!app.tick_due());
 
-        app.refresh_interval = Duration::from_millis(20);
-        app.refresh();
-        // 刚刷完：不该立刻 tick。（间隔不能取 1ms —— refresh 本身可能超过 1ms，
-        // 断言就永远轮不到「刚刷完」这个状态。）
-        assert!(!app.tick_due());
+        // `$STUI_AUTO_REFRESH` 开启后才按间隔 tick。（间隔不能取 1ms ——
+        // refresh 本身可能超过 1ms，断言就永远轮不到「刚刷完」这个状态。）
+        app.refresh_interval = Some(Duration::from_millis(20));
         std::thread::sleep(Duration::from_millis(50));
         assert!(app.tick_due());
 
         // 手动刷新把计时器重置。
         app.refresh();
         assert!(!app.tick_due());
+    }
+
+    #[test]
+    fn auto_refresh_interval_parsing_follows_env_contract() {
+        assert_eq!(parse_auto_refresh_secs(""), None);
+        assert_eq!(parse_auto_refresh_secs("0"), None);
+        assert_eq!(parse_auto_refresh_secs("abc"), None);
+        assert_eq!(parse_auto_refresh_secs("-3"), None);
+        assert_eq!(parse_auto_refresh_secs(" 10 "), Some(10));
+        assert_eq!(parse_auto_refresh_secs("1"), Some(1));
     }
 
     #[test]
@@ -3302,12 +3410,52 @@ mod tests {
 
     #[test]
     fn window_count_stays_hidden_unless_query_support_is_proven() {
-        // caps.query = Unknown（默认）：refresh 不得发出 -Q 查询，窗口数保持 None。
+        // caps.query = Unknown（默认）：详情可见也不得发出 -Q 查询，窗口数保持 None。
         // 这里不跑真实 screen —— 直接断言「未探测到就没有值」的不变式。
         let mut app = app_with(FOUR);
-        app.refresh_meta();
+        app.selected = 0;
+        app.ensure_window_count(true);
         assert!(app.window_count.is_none());
+        assert!(app.window_count_cache.is_none());
+        assert!(app.window_count_due(true).is_none());
         assert!(!app.caps.query.usable(), "default caps must stay Unknown");
+    }
+
+    #[test]
+    fn window_count_is_lazy_with_ttl_and_invalidation() {
+        // 不可见（Narrow 档未开详情）→ 不产生抓取决策。
+        let mut app = app_with(FOUR);
+        app.selected = 0;
+        app.caps.query = crate::screen::caps::Support::Yes;
+        assert!(app.window_count_due(false).is_none());
+
+        // 详情可见 → 决策给出目标会话。
+        let expected_full = app.sessions()[0].full.clone();
+        let full = app.window_count_due(true).expect("due for visible detail");
+        assert_eq!(full, expected_full);
+
+        // 抓取落账后：TTL 内同会话不再 due（不重复 spawn）。
+        app.window_count_cache = Some(WindowCountCache {
+            full: full.clone(),
+            count: Some(3),
+            fetched_at: Instant::now(),
+        });
+        assert!(app.window_count_due(true).is_none());
+        app.ensure_window_count(true);
+        assert_eq!(app.window_count, Some(3), "fresh cache is reused");
+
+        // 换选中会话 → 立即 due。
+        app.selected = 1;
+        assert!(app.window_count_due(true).is_some());
+
+        // 手动刷新（R 路径）作废缓存。
+        app.selected = 0;
+        app.window_count_cache = None;
+        app.enumerate = fake_enumerate; // refresh 走替身，不跑真实 screen -ls。
+        app.refresh();
+        // refresh 本身不再查窗口数（懒获取），窗口数保持 None 直到下次显示时抓取。
+        assert!(app.window_count.is_none());
+        assert!(app.window_count_due(true).is_some(), "invalidated by manual refresh");
     }
 
     // ------------------------------------------------------------- T2.3 预览

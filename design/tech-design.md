@@ -16,7 +16,7 @@
 | Screen 兼容下限 | 4.00.03（无 `-Q`，能力探测 + 降级） |
 | 目标平台 | linux/amd64、linux/arm64（musl 静态，Docker 编译）；macOS arm64/x86_64（本机编译） |
 | 分发 | 仅 GitHub Releases 二进制下载，不做安装脚本 |
-| 界面语言 | 英文 |
+| 界面语言 | 英文默认；`zh`/`en` 双语（i18n 手写翻译表），`STUI_LANG` > 配置 `language` > locale 探测 |
 
 ---
 
@@ -73,7 +73,7 @@ crossterm 的事件轮询自带超时，一个线程就够，不需要后台刷�
 loop {
     terminal.draw(|f| ui::render(f, &app))?;
 
-    let timeout = app.next_tick_in();          // 距下次刷新的剩余时间
+    let timeout = app.next_tick_in().min(POLL_CAP);  // 封顶 200ms：信号最长延迟 200ms 可见
     if crossterm::event::poll(timeout)? {
         match crossterm::event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
@@ -82,8 +82,9 @@ loop {
         }
     }
     if app.tick_due() {
-        app.refresh();                          // screen -q -ls 退出码 + 按需 -ls
+        app.refresh();                          // 仅在 $STUI_AUTO_REFRESH 开启时触发（FR-19 v0.2）
     }
+    app.ensure_window_count(detail_visible);    // 窗口数懒获取，10s TTL（FR-17 v0.2）
 }
 ```
 
@@ -92,6 +93,8 @@ loop {
 1. `KeyEventKind::Press` 过滤必须有 —— Windows/部分终端会上报 Release 事件，不滤会导致按键双触发。
 2. **不启用 crossterm 的键盘增强协议**（kitty protocol），保持与老 SSH 客户端（含手机客户端）最大兼容。
 3. attach 期间事件循环整个让位（见 §3.1），不存在「后台仍读事件」的竞态。
+4. *（v0.2）* 刷新默认**纯手动**（`R` + 动作后路径）：`refresh_interval == None` 时 `next_tick_in` 返回
+   `MAX`（被 `POLL_CAP` 钳制，纯阻塞等待），`tick_due` 恒否 —— 空转 CPU 实测 0%。
 
 ### 2.3 与需求文档的能力映射
 
@@ -220,7 +223,7 @@ Screen 不提供这些信息（capability 文档 §8 的边界结论），按平
 | 平台 | 实现 |
 | --- | --- |
 | Linux | 会话 pid → `/proc/<pid>/cwd`（readlink）、进程树首个非 screen 子进程的 `/proc/<pid>/cmdline` |
-| macOS | `ps -o pid,ppid,command -p <pid>` + `lsof -p <pid> -a -d cwd -Fn` |
+| macOS | libc 直调（v0.2，替代 spawn `ps`/`lsof`，单次从 ~50ms 降到 ~30µs）：`proc_listchildpids` 定位子进程，`proc_pidinfo(BSDINFO)` 拿 comm、`sysctl(KERN_PROCARGS2)` 拿完整 argv，`proc_pidinfo(VNODEPATHINFO)` 拿 cwd。libc crate 缺常量/结构的部分按 `proc_info.h` 手写，布局经实测锚定并有单测自检（`proc_cwd_matches_current_dir` 等） |
 
 统一抽象为 `probe::session_meta(pid) -> Option<Meta>`；**任何一步取不到就返回 `None`，UI 隐藏该字段**（C-5 不猜测）。探测失败不影响列表与连接主流程。
 

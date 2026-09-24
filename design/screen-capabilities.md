@@ -262,7 +262,7 @@ M0 期间对 5–8 采用的是**替身验证**：用一个脚本伪造 `screen`
 | 会话重命名 | `-X sessionname` | 不可用时隐藏该功能 |
 | 终止会话 | `-X quit` | `-wipe` 仅用于 dead |
 | 远程断开 | `-X detach` | 无 |
-| 工作目录 / 运行命令 | Screen 本身不提供 → 走 `/proc`（Linux）或 `ps`/`lsof`（macOS） | 取不到则留空，不猜测 |
+| 工作目录 / 运行命令 | Screen 本身不提供 → 走 `/proc`（Linux）或 `proc_pidinfo`/`KERN_PROCARGS2` libc 直调（macOS，v0.2 替代 `ps`/`lsof` spawn） | 取不到则留空，不猜测 |
 | 自定义别名 / 描述 / 收藏目录 | Screen 不提供 → 本工具自建配置 | — |
 | 会话数统计 / 状态图标 | `-ls` + 退出码 | — |
 
