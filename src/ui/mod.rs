@@ -723,18 +723,22 @@ mod tests {
     }
 
     #[test]
-    fn new_session_wizard_renders_steps_input_and_error() {
+    fn new_session_wizard_renders_fields_focus_and_error() {
         let mut app = app_with_fixture();
         app.open_new_session();
 
-        // 第 1 步：步骤指示 + 名字输入回显。
+        // 表单：焦点指示 + 三个字段全部可见 + 会被回车采纳的默认值 + 动作提示（验收 6）。
         let terminal = draw(&app, 80, 20);
         let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
         assert!(all.contains(" New session "), "{all:?}");
         assert!(all.contains("[1 Name]"), "{all:?}");
         assert!(all.contains("Name: "), "{all:?}");
+        assert!(all.contains("Directory: "), "目录默认值要看得见: {all:?}");
+        assert!(all.contains("Command: "), "命令默认值要看得见: {all:?}");
+        assert!(all.contains("Enter create"), "{all:?}");
+        assert!(all.contains("Esc cancel"), "{all:?}");
 
-        // 名字步报错：错误文本出现在弹层里。
+        // 校验失败：错误文本出现在弹层里，表单保持打开。
         app.draft.as_mut().unwrap().name = "-bad".into();
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::NewSession);
@@ -744,6 +748,24 @@ mod tests {
             all.contains("must not start with '-'"),
             "error is visible: {all:?}"
         );
+
+        // `Tab` 切焦点：目录成为焦点字段、名字回到暗色回显，提示语不变。
+        {
+            let draft = app.draft.as_mut().unwrap();
+            draft.name = "ok-name".into();
+            draft.error = None;
+        }
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.draft.as_ref().unwrap().focus, crate::app::NewField::Dir);
+        let terminal = draw(&app, 80, 20);
+        let all: String = (0..20u16).map(|y| line_at(&terminal, y)).collect();
+        assert!(all.contains("[2 Directory]"), "{all:?}");
+        assert!(all.contains("Directory: "), "{all:?}");
+        assert!(
+            all.contains("Enter create"),
+            "回车在任意字段都是创建: {all:?}"
+        );
+        assert!(!all.contains("[1 Name]"), "焦点指示跟着走: {all:?}");
     }
 
     fn key(code: ratatui::crossterm::event::KeyCode) -> crossterm::event::KeyEvent {

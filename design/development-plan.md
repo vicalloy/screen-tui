@@ -77,7 +77,7 @@ M0 出口：`make test` 全绿 + `make build-linux` 产物在真实 Linux 容器
 | T1.1 终端守护 | `ui::TuiGuard`（RAII：raw mode / alternate screen / 光标）+ panic hook + SIGINT/SIGTERM handler + 事件循环骨架 | T0.2 | ① 正常退出、`q`、panic、`kill -9` 四条路径后终端状态均完好（验收必测）；② `KeyEventKind::Press` 过滤生效；③ 不启用键盘增强协议 |
 | T1.2 列表视图 | `ui::list` + 状态图标（○◆◈✕?）+ `util::width` 裁剪 | T1.1, T0.3 | CJK/emoji 会话名 fixture 不错行；超宽时先截名字、绝不丢序号与状态（FR-01 验收 3） |
 | T1.3 双布局 | 四档布局（≥100 / 72–99 / <72 / <50）+ 小屏信息分级 | T1.2 | resize 后下次刷新自动重排；40×20 下首屏可见 ≥5 条会话；隐藏信息均有按键入口（FR-04/05） |
-| T1.4 新建会话 | `n` 向导（名/目录/命令）+ 自动命名 + `screen -U -dmS` + 错误路径 | T1.2 | 重名/非法名即时报错；创建后选中新会话；失败给可行动报错（FR-02 全部验收项） |
+| T1.4 新建会话 | `n` 向导（名/目录/命令）+ 自动命名 + `screen -U -dmS` + 错误路径 | T1.2 | 重名/非法名即时报错；创建后按配置直接进入或停留列表选中新会话；失败给可行动报错（FR-02 全部验收项） |
 | T1.5 连接闭环 | attached 冲突选择框（共享 `x` / 接管 `-d -r` / 取消）+ detach 提示 + exec `screen` + 返回刷新 | T1.1, T0.3, T0.6 | FR-03 全部 5 条验收：dead 拒连、全名回退、`$STY` 警告、会话消失不卡死、detach 必回列表 |
 
 M1 出口 = requirements.md「整体验收」第 1、3 条（纯键盘 40 列全流程 + detach 回列表）。

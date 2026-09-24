@@ -4,6 +4,7 @@
 //! 渲染层只读 `App`；`App` 的按键处理是纯状态变更（除显式标注的动作外不碰进程环境），
 //! 因此可脱离终端做单测。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,6 @@ use crate::screen::cmd::{self, AttachKind};
 use crate::screen::parse::{self, Enumeration, SessionRecord, Status};
 use crate::screen::probe;
 use crate::ui;
-use crate::util::time::local_label;
 
 /// 刷新间隔（FR-19：默认 3 秒，介于 spv 的 1s 与 screen-manager 的 5s 之间）。
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -50,43 +50,72 @@ pub enum Mode {
     MetaEdit,
 }
 
-/// 向导步骤：名 → 目录 → 命令，每步回车即接受默认值（FR-02 验收 1）。
+/// 向导的字段焦点：Name / Directory / Command 三字段同屏（FR-02 验收 6）。
+///
+/// 这不是「步骤」—— 三个字段不是必须逐个通过的闸门，而是表单里可来回切换的焦点；
+/// `Enter` 在任意字段都直接校验并创建，`Esc` 在任意字段都取消。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewStep {
+pub enum NewField {
     Name,
     Dir,
     Command,
 }
 
-impl NewStep {
+impl NewField {
     pub fn index(self) -> usize {
         match self {
-            NewStep::Name => 0,
-            NewStep::Dir => 1,
-            NewStep::Command => 2,
+            NewField::Name => 0,
+            NewField::Dir => 1,
+            NewField::Command => 2,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            NewStep::Name => "Name",
-            NewStep::Dir => "Directory",
-            NewStep::Command => "Command",
+            NewField::Name => "Name",
+            NewField::Dir => "Directory",
+            NewField::Command => "Command",
+        }
+    }
+
+    /// 焦点后移一位，到末字段**回绕**到首字段（FR-02 验收 6）。
+    pub fn next(self) -> Self {
+        match self {
+            NewField::Name => NewField::Dir,
+            NewField::Dir => NewField::Command,
+            NewField::Command => NewField::Name,
+        }
+    }
+
+    /// 焦点前移一位，到首字段**回绕**到末字段。
+    pub fn prev(self) -> Self {
+        match self {
+            NewField::Name => NewField::Command,
+            NewField::Dir => NewField::Name,
+            NewField::Command => NewField::Dir,
         }
     }
 }
 
-/// 新建向导的草稿状态。`error` 是阻断性错误（停在当前步），`note` 是非阻断提示
+/// 新建向导的草稿状态。`error` 是阻断性错误（表单保持打开），`note` 是非阻断提示
 /// （如重名提示 —— FR-02 验收 2 允许重名创建，但提示寻址方式）。
 ///
-/// 不派生 `Default`：`NewStep` 没有合理初值，向导一律经 `open_new_session()` 显式构造。
+/// 不派生 `Default`：`NewField` 没有合理初值，向导一律经 `open_new_session()` 显式构造。
 #[derive(Debug, Clone)]
 pub struct NewDraft {
-    pub step: NewStep,
+    /// 当前焦点字段（FR-02 验收 6）：`Tab`/`↓`/`↑` 循环切换，编辑与错误都落在它身上。
+    pub focus: NewField,
     pub name: String,
+    /// 打开向导时按 cwd 推出的名字基名（FR-02 验收 1）。
+    /// 提交前重定名以它为基 —— 拿已带后缀的当前名再追加会得到 `work22` 这种叠后缀。
+    pub name_base: String,
+    /// 用户是否改过名字。只有**没改过**时才在提交前自动换后缀；
+    /// 手打出来的重名仍只给非阻断提示（验收 2，不静默改名）。
+    pub name_edited: bool,
     pub dir: String,
     pub command: String,
-    /// 收藏目录快照（T2.7 / FR-23）：进入目录步时从配置取的最近目录（最多 9 条）。
+    /// 收藏目录快照（T2.7 / FR-23）：打开向导时从配置取的最近目录（最多 9 条），
+    /// 目录字段聚焦时可按 `1`–`9` 直选。
     pub recent: Vec<String>,
     pub error: Option<String>,
     pub note: Option<String>,
@@ -112,24 +141,60 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 默认会话名：`<当前目录名>-<MMDD-HHMM>`（FR-02 验收 1）。
+/// 会话名基名：目录名 → 合法名字（FR-02 验收 1）。
 ///
-/// 目录名先过一遍与 `validate_name` 同口径的清洗（空白 → `-`），保证默认值必过校验。
-pub fn default_session_name(dir: &std::path::Path, now: std::time::SystemTime) -> String {
-    let base = dir
+/// 清洗口径与 `validate_name` 一致，保证默认值必过校验：空白转 `-`、去掉控制字符、
+/// 剥去前导 `-` 与前导 `.`、取不到名字时用 `session`、超长按字符数截断。
+/// 前导 `-` 会被 screen 当选项读；前导 `.` 会让 socket 变成 `<pid>..name`。
+pub fn base_name(dir: &std::path::Path) -> String {
+    let raw = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "session".into());
-    let cleaned: String = base
+        .unwrap_or_default();
+    let cleaned: String = raw
         .chars()
+        .filter(|c| !c.is_control())
         .map(|c| if c.is_whitespace() { '-' } else { c })
         .collect();
-    let label = local_label(now);
-    if label.is_empty() {
-        cleaned
+    let stripped = cleaned.trim_start_matches(['-', '.']);
+    if stripped.is_empty() {
+        "session".into()
     } else {
-        format!("{cleaned}-{label}")
+        clip_chars(stripped, NAME_MAX)
     }
+}
+
+/// 按字符数截断（`validate_name` 的长度口径是字符数，不是显示宽度）。
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+/// 重名后缀的上限（`基名` → `基名2` … `基名9999`）。
+///
+/// 到达上限仍全被占用时退回基名：重名本身是允许的（screen 不做唯一性检查），
+/// 寻址方式由 FR-02 验收 2 的提示交代，这里不为了凑唯一而无限循环。
+const SUFFIX_MAX: u32 = 9999;
+
+/// 取第一个空闲会话名（FR-02 验收 1）：基名空闲就是基名，否则依次试 `基名2`、`基名3`…
+///
+/// `taken` 的判定范围由调用方给全（活跃会话 ∪ 配置里的留档名）。
+/// 加后缀前先截基名，**后缀必须完整保留** —— 否则 `…9` 之后会退化成同一个名字。
+pub fn next_free_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_string();
+    }
+    for n in 2..=SUFFIX_MAX {
+        let suffix = n.to_string();
+        let stem = clip_chars(base, NAME_MAX.saturating_sub(suffix.chars().count()));
+        let candidate = format!("{stem}{suffix}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    base.to_string()
 }
 
 /// 默认命令：`$SHELL`（非空时），否则 `/bin/sh`。
@@ -423,6 +488,8 @@ pub struct App {
     /// 会话枚举器（NFR-10 可测性）：生产用 [`parse::enumerate`]，
     /// 测试注入替身 —— 与 M1 的 `plan_connect` 注入风格一致，但覆盖所有调用点。
     enumerate: fn() -> crate::screen::Result<Enumeration>,
+    /// 会话创建器（可测性）：生产用 [`cmd::create`]，测试注入替身 —— 单测不得真的起 screen。
+    create: fn(&str, &std::path::Path, &str) -> crate::screen::Result<cmd::Run>,
     /// 待事件循环消费的**动作**请求（已过确认框）。
     action_request: Option<ConfirmAction>,
     /// 待事件循环消费的重命名请求。
@@ -466,6 +533,7 @@ impl App {
             config_path_override: None,
             config_read_only: false,
             enumerate: parse::enumerate,
+            create: cmd::create,
             action_request: None,
             rename_request: None,
             attach_request: None,
@@ -1456,13 +1524,21 @@ impl App {
 
     // ------------------------------------------------------------- 新建会话（T1.4）
 
-    /// 打开三步向导：预填当前目录、默认名、`$SHELL`（FR-02 验收 1）。
+    /// 打开新建向导：预填当前目录、默认名（目录名 + 重名数字后缀）、`$SHELL`（FR-02 验收 1）。
+    ///
+    /// 取名吃的是**当前缓存列表** —— 打开向导不该为了取名先起一次 `screen`。
+    /// 真有并发创建时由提交前那次重定名兜住（见 [`App::refit_default_name`]）。
     pub fn open_new_session(&mut self) {
         let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let recent = self.recent_dirs_for_wizard();
+        let taken = self.taken_names(None);
+        let base = base_name(&dir);
+        let name = next_free_name(&base, |candidate| taken.contains(candidate));
         self.draft = Some(NewDraft {
-            step: NewStep::Name,
-            name: default_session_name(&dir, std::time::SystemTime::now()),
+            focus: NewField::Name,
+            name,
+            name_base: base,
+            name_edited: false,
             dir: dir.display().to_string(),
             command: default_command(),
             recent,
@@ -1472,7 +1548,7 @@ impl App {
         self.mode = Mode::NewSession;
     }
 
-    /// 向导目录步展示的收藏目录（最多 9 条 —— 数字键 1–9 直选）。
+    /// 向导目录字段展示的收藏目录（最多 9 条 —— 聚焦时数字键 1–9 直选）。
     fn recent_dirs_for_wizard(&self) -> Vec<String> {
         self.config
             .dirs
@@ -1482,20 +1558,40 @@ impl App {
             .collect()
     }
 
-    fn on_key_new(&mut self, code: KeyCode) {
-        // 收藏目录数字直选（T2.7 / FR-23）：目录步的 1–9；无效数字落入一般输入。
-        if let Some(draft) = self.draft.as_mut()
-            && draft.step == NewStep::Dir
-            && let KeyCode::Char(c) = code
-            && c.is_ascii_digit()
-            && c != '0'
-        {
-            let index = (c as u8 - b'1') as usize;
-            if let Some(path) = draft.recent.get(index).cloned() {
-                draft.dir = path;
-                self.advance_new();
-                return;
+    /// 已占用的会话名集合（FR-02 验收 1）：活跃会话（含 dead —— dead 名仍占 socket 名）
+    /// ∪ 配置里留档的会话名。
+    ///
+    /// 走 `all_sessions()` / 原始枚举而不是 `sessions()`：过滤是展示层的视图，
+    /// 不能因为用户正在筛东西，就把被筛掉的会话名当成空闲。
+    fn taken_names(&self, fresh: Option<&Enumeration>) -> HashSet<String> {
+        let mut taken: HashSet<String> = self.config.sessions.keys().cloned().collect();
+        match fresh {
+            Some(enumeration) => {
+                taken.extend(enumeration.list.sessions.iter().map(|s| s.name.clone()));
             }
+            None => taken.extend(self.all_sessions().iter().map(|s| s.name.clone())),
+        }
+        taken
+    }
+
+    fn on_key_new(&mut self, code: KeyCode) {
+        // 收藏目录数字直选（T2.7 / FR-23）：只在目录字段聚焦且该序号存在时接管 1–9，
+        // 其余字段里数字就是普通字符。
+        if let Some(path) = self.recent_pick(code) {
+            if let Some(draft) = self.draft.as_mut() {
+                draft.dir = path;
+                draft.error = None;
+            }
+            return;
+        }
+
+        // 结构性按键先处理完：它们整体接管 `self.draft`，不和字段编辑的借用缠在一起。
+        match code {
+            KeyCode::Esc => return self.cancel_new(),
+            KeyCode::Enter => return self.commit_new(),
+            KeyCode::Tab | KeyCode::Down => return self.cycle_focus(true),
+            KeyCode::BackTab | KeyCode::Up => return self.cycle_focus(false),
+            _ => {}
         }
 
         let Some(draft) = self.draft.as_mut() else {
@@ -1504,18 +1600,19 @@ impl App {
             return;
         };
         match code {
-            KeyCode::Esc => {
-                self.draft = None;
-                self.mode = Mode::List;
-            }
-            KeyCode::Enter => self.advance_new(),
             KeyCode::Backspace => {
                 draft.error = None;
+                if draft.focus == NewField::Name {
+                    draft.name_edited = true;
+                }
                 let field = current_field_mut(draft);
                 field.pop();
             }
             KeyCode::Char(c) if !c.is_control() => {
                 draft.error = None;
+                if draft.focus == NewField::Name {
+                    draft.name_edited = true;
+                }
                 let field = current_field_mut(draft);
                 field.push(c);
             }
@@ -1523,76 +1620,173 @@ impl App {
         }
     }
 
-    /// 回车推进：当前步校验通过后进入下一步；最后一步触发真实创建。
-    fn advance_new(&mut self) {
+    /// 目录字段的数字直选：返回被选中的收藏目录；非目录字段 / 非 1–9 / 序号越界一律 `None`。
+    fn recent_pick(&self, code: KeyCode) -> Option<String> {
+        let KeyCode::Char(c) = code else {
+            return None;
+        };
+        if !c.is_ascii_digit() || c == '0' {
+            return None;
+        }
+        let draft = self.draft.as_ref()?;
+        if draft.focus != NewField::Dir {
+            return None;
+        }
+        draft.recent.get((c as u8 - b'1') as usize).cloned()
+    }
+
+    /// `Esc` 取消（FR-02 验收 6）：单表单没有「上一步」，任何字段都是直接放弃草稿回列表。
+    fn cancel_new(&mut self) {
+        self.draft = None;
+        self.mode = Mode::List;
+    }
+
+    /// `Tab`/`↓` 后移、`↑`/Shift+`Tab` 前移，到边界循环回绕（FR-02 验收 6）。
+    ///
+    /// 焦点离开 Name 字段时把重名提示落到 `note` 上 —— 早看到早决定，
+    /// 不用等到按 `Enter` 才知道 `<pid>.<name>` 这件事。
+    fn cycle_focus(&mut self, forward: bool) {
+        let Some(draft) = self.draft.as_ref() else {
+            return;
+        };
+        let leaving_name = draft.focus == NewField::Name;
+        let name = draft.name.clone();
+
+        let note = if leaving_name {
+            self.duplicate_note(&name)
+        } else {
+            None
+        };
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        draft.focus = if forward {
+            draft.focus.next()
+        } else {
+            draft.focus.prev()
+        };
+        if let Some(note) = note {
+            draft.note = Some(note);
+        }
+    }
+
+    /// 提交草稿并创建（FR-02 验收 4/6）：三字段一起校验，任一不过就把焦点跳到
+    /// 出错字段、红字报错，表单保持打开。
+    ///
+    /// `Enter` 在任意字段都是这个终点 —— 默认值既然已经预填，就不该再要求用户
+    /// 逐字段回车「批准」它们。
+    fn commit_new(&mut self) {
         let Some(mut draft) = self.draft.take() else {
             self.mode = Mode::List;
             return;
         };
 
-        match draft.step {
-            NewStep::Name => {
-                draft.name = draft.name.trim().to_string();
-                if let Err(err) = validate_name(&draft.name) {
-                    draft.error = Some(err);
-                    self.draft = Some(draft);
-                    return;
-                }
-                draft.note = self.duplicate_note(&draft.name);
-                draft.error = None;
-                draft.step = NewStep::Dir;
-                // 目录步展示收藏目录快照（T2.7）。
-                draft.recent = self.recent_dirs_for_wizard();
+        for field in [NewField::Name, NewField::Dir, NewField::Command] {
+            if let Err(err) = check_field(&draft, field) {
+                draft.focus = field;
+                draft.error = Some(err);
                 self.draft = Some(draft);
-            }
-            NewStep::Dir => {
-                draft.dir = expand_tilde(draft.dir.trim());
-                if draft.dir.is_empty() {
-                    draft.error = Some("directory must not be empty".into());
-                    self.draft = Some(draft);
-                    return;
-                }
-                if !std::path::Path::new(&draft.dir).is_dir() {
-                    draft.error = Some(format!("not a directory: {}", draft.dir));
-                    self.draft = Some(draft);
-                    return;
-                }
-                draft.error = None;
-                draft.step = NewStep::Command;
-                self.draft = Some(draft);
-            }
-            NewStep::Command => {
-                draft.command = draft.command.trim().to_string();
-                if draft.command.is_empty() {
-                    draft.error = Some("command must not be empty".into());
-                    self.draft = Some(draft);
-                    return;
-                }
-                let name = draft.name.clone();
-                let dir = draft.dir.clone();
-                let command = draft.command.clone();
-                let note = draft.note.take();
-
-                match self.create_session(&name, &dir, &command) {
-                    Ok(selected) => {
-                        // 成功：草稿丢弃，回列表，选中并确认新会话（FR-02 验收 5）。
-                        self.draft = None;
-                        self.mode = Mode::List;
-                        self.selected = selected;
-                        self.status = Some(match note {
-                            Some(hint) => format!("created '{name}' ({hint})"),
-                            None => format!("created '{name}'"),
-                        });
-                        self.refresh();
-                    }
-                    Err(message) => {
-                        // 失败：草稿保留在最后一步，可行动报错，不静默（FR-02 验收 4）。
-                        draft.error = Some(message);
-                        self.draft = Some(draft);
-                    }
-                }
+                return;
             }
         }
+
+        draft.name = draft.name.trim().to_string();
+        draft.dir = expand_tilde(draft.dir.trim());
+        // 命令留空 = 落回默认 shell（FR-02）：清空字段是合法动作，不报错。
+        let command = draft.command.trim();
+        draft.command = if command.is_empty() {
+            default_command()
+        } else {
+            command.to_string()
+        };
+
+        if draft.name_edited {
+            draft.note = self.duplicate_note(&draft.name);
+        } else {
+            // 名字没被动过：用最新列表再确认一次（NFR-08「列表不可信，动作前重验」）。
+            let refit = self.refit_default_name(&draft.name_base, &draft.name);
+            if refit != draft.name {
+                draft.note = Some(format!("'{}' was taken; used '{refit}'", draft.name));
+                draft.name = refit;
+            }
+        }
+
+        let name = draft.name.clone();
+        let dir = draft.dir.clone();
+        let command = draft.command.clone();
+        let note = draft.note.take();
+
+        match self.create_session(&name, &dir, &command) {
+            Ok(selected) => {
+                self.draft = None;
+                self.mode = Mode::List;
+                self.selected = selected;
+                // 先刷新再落账：refresh() 成功时会清掉瞬态消息，结果消息必须留在最后。
+                self.refresh();
+                self.status = Some(match note {
+                    Some(hint) => format!("created '{name}' ({hint})"),
+                    None => format!("created '{name}'"),
+                });
+                if self.config.defaults.attach_after_create {
+                    self.auto_enter_created(&name);
+                }
+            }
+            Err(message) => {
+                // 失败：草稿原样保留（焦点不动），可行动报错，不静默（FR-02 验收 5）。
+                draft.error = Some(message);
+                self.draft = Some(draft);
+            }
+        }
+    }
+
+    /// 创建后自动进入新会话（FR-02 验收 4）。
+    ///
+    /// 只在能确定「列表里那一个就是刚建的这一个」时才进。名字不唯一时 `-r <name>` 本身就有歧义，
+    /// 而 [`unambiguous_target`] 取的是列表里先出现的那个 —— 那可能是早就存在的同名会话，
+    /// 于是我们会**静默进入错误的会话**。这种情况不猜：说清楚，让用户自己选。
+    fn auto_enter_created(&mut self, name: &str) {
+        let matches = self.sessions().iter().filter(|s| s.name == name).count();
+        let skip_reason = match matches {
+            0 => Some("it is not in the session list yet"),
+            1 => None,
+            _ => Some("the name is not unique; start it as <pid>.<name>"),
+        };
+        match skip_reason {
+            // 用刚刷新过的那份列表交给连接闭环重校验，不再额外枚举一次。
+            None => {
+                if let Some(fresh) = self.enumeration.clone() {
+                    self.plan_connect(fresh);
+                }
+            }
+            Some(reason) => self.note_auto_enter_skipped(name, reason),
+        }
+    }
+
+    /// 自动进入被跳过时，把原因追加到「已创建」这条消息后面 —— 创建本身成功，不覆盖这个事实。
+    fn note_auto_enter_skipped(&mut self, name: &str, reason: &str) {
+        let created = format!("created '{name}'");
+        let base = self
+            .status
+            .take()
+            .filter(|status| status.starts_with(&created))
+            .unwrap_or(created);
+        self.status = Some(format!("{base}; not entering: {reason}"));
+    }
+
+    /// 提交前确认默认名（FR-02 验收 1）。
+    ///
+    /// 只在**名字没被改过**时介入，且只在当前这个名字已被占用时才换 ——
+    /// 名字仍然空闲就保留用户看到的那一个，不让「屏幕上显示 work2、创建出来 work」发生。
+    /// 拿不到新鲜列表就退回当前名字：宁可多给一次重名提示，也不阻断创建。
+    fn refit_default_name(&self, base: &str, current: &str) -> String {
+        let Ok(fresh) = (self.enumerate)() else {
+            return current.to_string();
+        };
+        let taken = self.taken_names(Some(&fresh));
+        if !taken.contains(current) {
+            return current.to_string();
+        }
+        next_free_name(base, |candidate| taken.contains(candidate))
     }
 
     /// 重名提示（非阻断）：FR-02 验收 2 —— 允许创建，提示「将以 `<pid>.<name>` 寻址」。
@@ -1604,10 +1798,13 @@ impl App {
     }
 
     /// 执行创建并刷新列表。成功返回新会话在（刷新后）列表中的下标。
+    ///
+    /// 这里只负责「建出来 + 把选中项对准它 + 记元数据」；要不要直接进去由
+    /// [`App::auto_enter_created`] 在拿到刷新后的列表之后再决定（FR-02 验收 4）。
     fn create_session(&mut self, name: &str, dir: &str, command: &str) -> Result<usize, String> {
         let path = std::path::PathBuf::from(dir);
         let run =
-            cmd::create(name, &path, command).map_err(|err| format!("create failed: {err}"))?;
+            (self.create)(name, &path, command).map_err(|err| format!("create failed: {err}"))?;
 
         if !run.success() {
             let detail = run.text();
@@ -1630,9 +1827,9 @@ impl App {
         self.save_config();
 
         // 创建成功后立刻重枚举，把选中项对准新会话（FR-02 验收 5）。
-        match parse::enumerate() {
+        match (self.enumerate)() {
             Ok(enumeration) => {
-                let index = enumeration
+                let found = enumeration
                     .list
                     .sessions
                     .iter()
@@ -1640,19 +1837,43 @@ impl App {
                 self.apply_enumeration(enumeration);
                 // 绕过了 refresh()，这里补计时起点，避免下一轮立即重复枚举。
                 self.last_refresh = Some(Instant::now());
-                Ok(index.unwrap_or(0))
+
+                // 找不到就报 0（列表第 0 行）—— 调用方据此不会去连接一个没认出来的会话。
+                self.selected = found.unwrap_or(0);
+                Ok(self.selected)
             }
             Err(_) => Ok(0), // 列表刷新失败不回滚创建本身；下个轮询周期自会补上。
         }
     }
 }
 
-/// 当前草稿步对应的可编辑字段。
+/// 单字段校验（纯函数）：返回阻断性错误，`Ok` 表示该字段可以放行。
+///
+/// Name 与 Directory 沿用各自的原有口径；Command **没有**阻断性错误 ——
+/// 留空等于落回默认 shell（FR-02），清空字段是合法动作。
+fn check_field(draft: &NewDraft, field: NewField) -> Result<(), String> {
+    match field {
+        NewField::Name => validate_name(draft.name.trim()),
+        NewField::Dir => {
+            let dir = expand_tilde(draft.dir.trim());
+            if dir.is_empty() {
+                return Err("directory must not be empty".into());
+            }
+            if !std::path::Path::new(&dir).is_dir() {
+                return Err(format!("not a directory: {dir}"));
+            }
+            Ok(())
+        }
+        NewField::Command => Ok(()),
+    }
+}
+
+/// 当前焦点字段对应的可编辑字段。
 fn current_field_mut(draft: &mut NewDraft) -> &mut String {
-    match draft.step {
-        NewStep::Name => &mut draft.name,
-        NewStep::Dir => &mut draft.dir,
-        NewStep::Command => &mut draft.command,
+    match draft.focus {
+        NewField::Name => &mut draft.name,
+        NewField::Dir => &mut draft.dir,
+        NewField::Command => &mut draft.command,
     }
 }
 
@@ -1894,6 +2115,8 @@ mod tests {
     fn app_with(text: &str) -> App {
         let mut app = App::new(Caps::default());
         app.apply_enumeration(enumeration(text));
+        // 默认就装上创建替身：单测里任何一条路径都不许真的起 screen。
+        app.create = fake_create;
         app
     }
 
@@ -2016,16 +2239,60 @@ mod tests {
     }
 
     #[test]
-    fn default_name_is_dirname_plus_timestamp() {
-        let now = std::time::SystemTime::now();
-        let name = default_session_name(std::path::Path::new("/Users/x/my proj"), now);
-        // 空格被清洗成 `-`，保证默认值必过校验（FR-02 验收 1）。
-        assert!(name.starts_with("my-proj-"), "{name}");
+    fn base_name_cleans_a_dirname_into_a_legal_name() {
+        let base = |p: &str| base_name(std::path::Path::new(p));
+        // 空格 → `-`（沿用原口径）。
+        assert_eq!(base("/Users/x/my proj"), "my-proj");
+        // 前导 `-`：目录名 `-foo` 会让 screen 把名字当选项读。
+        assert_eq!(base("/tmp/-foo"), "foo");
+        // 前导 `.`：隐藏目录会做出 `<pid>..config` 这种 socket 名。
+        assert_eq!(base("/home/u/.config"), "config");
+        // 控制字符直接去掉。
+        assert_eq!(base("/tmp/a\u{7}b"), "ab");
+        // 取不到目录名（根）与洗完为空 → `session`。
+        assert_eq!(base("/"), "session");
+        assert_eq!(base("/tmp/..."), "session");
+        // 无论怎么洗，结果都必须过 `validate_name`。
+        for path in [
+            "/Users/x/my proj",
+            "/tmp/-foo",
+            "/home/u/.config",
+            "/",
+            "/tmp/...",
+        ] {
+            let name = base(path);
+            assert!(validate_name(&name).is_ok(), "{path} -> {name}");
+        }
+    }
+
+    #[test]
+    fn next_free_name_appends_digits_until_free() {
+        let taken: HashSet<String> = ["work", "work2", "work3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 基名空闲就是基名本身。
+        assert_eq!(next_free_name("idle", |n| taken.contains(n)), "idle");
+        // 占用了就往后数，不是只试一次。
+        assert_eq!(next_free_name("work", |n| taken.contains(n)), "work4");
+        // 判定函数看到的是完整候选名（含后缀），不是基名。
+        assert_eq!(next_free_name("work2", |n| n == "work2"), "work22");
+    }
+
+    #[test]
+    fn next_free_name_keeps_the_suffix_when_clipping() {
+        // 基名顶到 NAME_MAX：加后缀前必须先截基名，否则名字会超长。
+        let base = "a".repeat(NAME_MAX);
+        let name = next_free_name(&base, |candidate| candidate == base);
+        assert_eq!(name.chars().count(), NAME_MAX, "{name}");
+        assert!(name.ends_with('2'), "{name}");
         assert!(validate_name(&name).is_ok(), "{name}");
-        // `MMDD-HHMM` 尾巴。
-        let tail = &name["my-proj-".len()..];
-        assert_eq!(tail.len(), 9, "{name}");
-        assert_eq!(tail.as_bytes()[4], b'-');
+    }
+
+    #[test]
+    fn next_free_name_gives_up_and_reuses_the_base() {
+        // 后缀打满仍占满时退回基名，不无限循环；重名由 FR-02 验收 2 的提示兜底。
+        assert_eq!(next_free_name("work", |_| true), "work");
     }
 
     #[test]
@@ -2041,36 +2308,144 @@ mod tests {
         assert_eq!(expand_tilde("~root/x"), "~root/x");
     }
 
+    // ------------------------------------------------------------- T1.4 新建会话
+
+    // 创建替身记录的「最后一次创建请求」。
+    thread_local! {
+        static CREATE_LOG: std::cell::RefCell<Option<(String, std::path::PathBuf, String)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// 创建替身：不碰 screen，只记参数，回一个「成功」的退出码。
+    fn fake_create(
+        name: &str,
+        dir: &std::path::Path,
+        command: &str,
+    ) -> crate::screen::Result<cmd::Run> {
+        let request = (name.to_string(), dir.to_path_buf(), command.to_string());
+        CREATE_LOG.with(|log| *log.borrow_mut() = Some(request));
+        Ok(cmd::Run {
+            command: format!("screen -U -dmS {name} {command}"),
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+
+    /// 创建替身：screen 明确拒绝（非零退出码 + 诊断文本）。
+    fn fake_create_fails(
+        _name: &str,
+        _dir: &std::path::Path,
+        _command: &str,
+    ) -> crate::screen::Result<cmd::Run> {
+        Ok(cmd::Run {
+            command: "screen -U -dmS work zsh".into(),
+            code: 1,
+            stdout: String::new(),
+            stderr: "Session name 'work' already exists".into(),
+        })
+    }
+
+    /// 枚举替身：回一张只含「最后被请求创建的那个会话」的表。
+    ///
+    /// 这样创建后的选中 / 自动进入有真实对象可用，同时把「向导打开后名字被别人占了」
+    /// 这件事也表达成「这个替身已经能看见它」—— 不需要为测试再造一条旁路。
+    fn enumerate_created() -> crate::screen::Result<Enumeration> {
+        let name = CREATE_LOG.with(|log| log.borrow().as_ref().map(|(name, ..)| name.clone()));
+        let text = match name {
+            Some(name) => format!(
+                "There is a screen on:\n\t12345.{name}\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n"
+            ),
+            None => "No Sockets found in /tmp/.screen.\n".to_string(),
+        };
+        Ok(enumeration(&text))
+    }
+
+    /// 枚举替身：永远空表（创建成功但列表里查无此会话）。
+    fn enumerate_empty() -> crate::screen::Result<Enumeration> {
+        Ok(enumeration("No Sockets found in /tmp/.screen.\n"))
+    }
+
+    /// 枚举替身：回两张**同名**的表（模拟用户手打了一个已存在的名字）。
+    fn enumerate_created_ambiguous() -> crate::screen::Result<Enumeration> {
+        let name = CREATE_LOG
+            .with(|log| log.borrow().as_ref().map(|(name, ..)| name.clone()))
+            .unwrap_or_else(|| "work".into());
+        Ok(enumeration(&format!(
+            "There are screens on:\n\t12345.{name}\t(09/23/2026 10:00:00 AM)\t(Detached)\n\t12346.{name}\t(09/23/2026 10:01:00 AM)\t(Detached)\n2 Sockets in /tmp/.screen.\n"
+        )))
+    }
+
+    /// 装上创建替身并清掉上一轮的记录 —— 测试线程会被复用，`CREATE_LOG` 必须由各用例自己清零。
+    fn stub_creation(app: &mut App, enumerate: fn() -> crate::screen::Result<Enumeration>) {
+        CREATE_LOG.with(|log| *log.borrow_mut() = None);
+        app.create = fake_create;
+        app.enumerate = enumerate;
+    }
+
     #[test]
     fn wizard_opens_with_prefilled_defaults() {
         let mut app = app_with(FOUR);
         app.on_key(key(KeyCode::Char('n')));
         assert_eq!(app.mode, Mode::NewSession);
+
+        // 默认名 = 当前目录名，重名才追加数字（FR-02 验收 1）。
+        let base = base_name(&std::env::current_dir().unwrap());
+        let expected = next_free_name(&base, |candidate| {
+            app.config.sessions.contains_key(candidate)
+                || app.all_sessions().iter().any(|s| s.name == candidate)
+        });
+
+        let cwd = std::env::current_dir().unwrap();
         let draft = app.draft.as_ref().expect("draft created");
-        assert_eq!(draft.step, NewStep::Name);
-        assert!(!draft.name.is_empty());
-        assert!(
-            validate_name(&draft.name).is_ok(),
-            "default must pass: {}",
-            draft.name
-        );
+        assert_eq!(draft.focus, NewField::Name);
+        assert_eq!(draft.name_base, base);
+        assert_eq!(draft.name, expected);
+        assert!(!draft.name_edited, "预填的默认名不等于「用户改过」");
+        assert!(validate_name(&draft.name).is_ok(), "{}", draft.name);
+        assert_eq!(draft.dir, cwd.display().to_string());
         assert_eq!(draft.command, default_command());
+
         // 再按 n 不叠加草稿。
         app.on_key(key(KeyCode::Char('n')));
-        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Name);
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Name);
     }
 
     #[test]
-    fn wizard_esc_cancels_and_returns_to_list() {
+    fn wizard_default_name_dodges_names_kept_in_config() {
+        // 占用判定含配置里留档的会话名：只出现在 config 里的名字也要避开（FR-02 验收 1）。
+        let base = base_name(&std::env::current_dir().unwrap());
         let mut app = app_with(FOUR);
+        app.config
+            .sessions
+            .insert(base.clone(), crate::config::SessionMeta::default());
+
         app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.draft.as_ref().unwrap().name, format!("{base}2"));
+        assert_eq!(app.draft.as_ref().unwrap().name_base, base);
+    }
+
+    #[test]
+    fn wizard_esc_cancels_from_any_field() {
+        let mut app = app_with(FOUR);
+        app.open_new_session();
+
+        // 单表单没有「上一步」：任何字段的 Esc 都是取消（FR-02 验收 6）。
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.draft.is_none());
+
+        app.open_new_session();
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Command);
         app.on_key(key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::List);
         assert!(app.draft.is_none());
     }
 
     #[test]
-    fn wizard_input_edits_only_the_current_step() {
+    fn wizard_input_edits_only_the_focused_field() {
         let mut app = app_with(FOUR);
         app.open_new_session();
         let original_name = app.draft.as_ref().unwrap().name.clone();
@@ -2080,53 +2455,256 @@ mod tests {
             app.draft.as_ref().unwrap().name,
             format!("{original_name}x")
         );
+        assert!(
+            app.draft.as_ref().unwrap().name_edited,
+            "改过名字要留痕（决定提交前是否换后缀）"
+        );
 
         app.on_key(key(KeyCode::Backspace));
         assert_eq!(app.draft.as_ref().unwrap().name, original_name);
 
-        // 目录步里输入不会误改名字。
-        app.draft.as_mut().unwrap().step = NewStep::Dir;
+        // 焦点在目录字段时输入不会误改名字。
+        app.draft.as_mut().unwrap().focus = NewField::Dir;
         app.on_key(key(KeyCode::Char('/')));
         assert!(app.draft.as_ref().unwrap().dir.ends_with('/'));
         assert_eq!(app.draft.as_ref().unwrap().name, original_name);
     }
 
     #[test]
-    fn wizard_rejects_invalid_name_and_stays_on_step() {
+    fn wizard_invalid_name_jumps_focus_back_to_name() {
         let mut app = app_with(FOUR);
         app.open_new_session();
+        // 用户在目录字段按回车，但名字非法 → 焦点跳回 Name 并报错（FR-02 验收 6）。
+        app.draft.as_mut().unwrap().focus = NewField::Dir;
         app.draft.as_mut().unwrap().name = "-bad".into();
 
         app.on_key(key(KeyCode::Enter));
         let draft = app.draft.as_ref().unwrap();
-        assert_eq!(draft.step, NewStep::Name, "stays on the name step");
+        assert_eq!(draft.focus, NewField::Name, "jumps to the offending field");
         assert!(draft.error.is_some(), "reports the reason");
     }
 
     #[test]
-    fn wizard_advances_through_valid_steps() {
+    fn wizard_tab_and_arrows_cycle_focus() {
         let mut app = app_with(FOUR);
         app.open_new_session();
+        // 收藏目录在打开向导时就装好（表单没有「进入目录步」的动作了）。
+        assert_eq!(
+            app.draft.as_ref().unwrap().recent,
+            app.recent_dirs_for_wizard()
+        );
 
-        app.on_key(key(KeyCode::Enter)); // 默认名合法 → Dir
-        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Dir);
+        // Tab 与 ↓ 同向循环：Name → Dir → Command → Name（回绕）。
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Dir);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Command);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Name, "回绕");
 
-        app.on_key(key(KeyCode::Enter)); // 默认目录合法 → Command
-        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Command);
-        // 不真实创建：到此为止，Esc 退出。
-        app.on_key(key(KeyCode::Esc));
+        // ↑ 与 Shift+Tab（BackTab）反向循环：Name → Command（回绕）→ Dir。
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Command);
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Dir);
+    }
+
+    #[test]
+    fn wizard_enter_on_name_creates_with_all_defaults() {
+        let (mut app, dir) = app_with_config_dir("wizard-enter");
+        stub_creation(&mut app, enumerate_created);
+
+        app.on_key(key(KeyCode::Char('n')));
+        let expected_name = app.draft.as_ref().unwrap().name.clone();
+        let expected_dir = app.draft.as_ref().unwrap().dir.clone();
+
+        app.on_key(key(KeyCode::Enter)); // 名字步一次回车 = 创建（FR-02 验收 6）
+
+        let (name, got_dir, command) = CREATE_LOG
+            .with(|log| log.borrow().clone())
+            .expect("created");
+        assert_eq!(name, expected_name);
+        assert_eq!(got_dir.display().to_string(), expected_dir);
+        assert_eq!(command, default_command(), "命令用默认值");
+
         assert_eq!(app.mode, Mode::List);
+        assert!(app.draft.is_none());
+        assert_eq!(app.selected, 0, "选中新会话");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("created")
+        );
+        // 默认直接进入新会话（FR-02 验收 4）。
+        let request = app.take_attach_request().expect("auto attach requested");
+        assert_eq!(request.kind, AttachKind::Resume);
+        assert_eq!(request.target, expected_name);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wizard_attach_after_create_is_configurable() {
+        let (mut app, dir) = app_with_config_dir("wizard-attach");
+        stub_creation(&mut app, enumerate_created);
+        assert!(
+            app.config.defaults.attach_after_create,
+            "默认直接进入（FR-02 验收 4）"
+        );
+
+        // 关掉之后停留列表，不产生连接请求。
+        app.config.defaults.attach_after_create = false;
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.take_attach_request().is_none());
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("created")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wizard_empty_command_falls_back_to_the_default_shell() {
+        let (mut app, dir) = app_with_config_dir("wizard-empty-cmd");
+        stub_creation(&mut app, enumerate_created);
+        app.on_key(key(KeyCode::Char('n')));
+        app.draft.as_mut().unwrap().command = "   ".into();
+
+        app.on_key(key(KeyCode::Enter));
+
+        let (_, _, command) = CREATE_LOG
+            .with(|log| log.borrow().clone())
+            .expect("created");
+        assert_eq!(command, default_command(), "清空命令 = 落回默认 shell");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wizard_hand_typed_name_is_not_silently_renamed() {
+        let (mut app, dir) = app_with_config_dir("wizard-typed");
+        stub_creation(&mut app, enumerate_created);
+        app.on_key(key(KeyCode::Char('n')));
+
+        let draft = app.draft.as_mut().unwrap();
+        draft.name = "work".into(); // 与 FOUR 里的 work 撞名
+        draft.name_edited = true;
+        app.on_key(key(KeyCode::Enter));
+
+        let (name, ..) = CREATE_LOG
+            .with(|log| log.borrow().clone())
+            .expect("created");
+        assert_eq!(name, "work", "手打的名字原样提交，不擅自改名");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("<pid>.work"),
+            "改为提示寻址方式（FR-02 验收 2）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wizard_refits_the_default_name_if_it_got_taken() {
+        let (mut app, dir) = app_with_config_dir("wizard-refit");
+        stub_creation(&mut app, enumerate_created);
+        app.on_key(key(KeyCode::Char('n')));
+        let shown = app.draft.as_ref().unwrap().name.clone();
+
+        // 向导开着的时候，这个名字被别处占了（列表 3 秒轮询之外的窗口）。
+        CREATE_LOG.with(|log| {
+            *log.borrow_mut() = Some((shown.clone(), PathBuf::from("/tmp"), "/bin/sh".into()));
+        });
+        app.on_key(key(KeyCode::Enter));
+
+        let (name, ..) = CREATE_LOG
+            .with(|log| log.borrow().clone())
+            .expect("created");
+        assert_eq!(name, format!("{shown}2"), "默认名被占则换后缀");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("was taken"),
+            "改名要说清原因：{:?}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wizard_skips_attach_when_the_new_session_is_missing_from_the_list() {
+        let (mut app, dir) = app_with_config_dir("wizard-missing");
+        stub_creation(&mut app, enumerate_empty);
+        app.on_key(key(KeyCode::Char('n')));
+
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            app.take_attach_request().is_none(),
+            "找不到新会话就不动选中项，否则会一头扎进列表第 0 行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wizard_skips_attach_when_the_new_name_is_ambiguous() {
+        let (mut app, dir) = app_with_config_dir("wizard-ambiguous");
+        stub_creation(&mut app, enumerate_created_ambiguous);
+        app.on_key(key(KeyCode::Char('n')));
+
+        let draft = app.draft.as_mut().unwrap();
+        draft.name = "work".into(); // 手打一个已存在的名字 → 列表里同名两条
+        draft.name_edited = true;
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::List, "创建本身成功，退出向导");
+        assert!(
+            app.take_attach_request().is_none(),
+            "同名两条时 `-r work` 指哪个不确定，不能猜"
+        );
+        let status = app.status.as_deref().unwrap_or_default();
+        assert!(status.contains("created 'work'"), "{status}");
+        assert!(status.contains("not entering"), "{status}");
+        assert!(status.contains("not unique"), "{status}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wizard_failed_create_keeps_the_draft_and_reports() {
+        let (mut app, dir) = app_with_config_dir("wizard-create-fail");
+        stub_creation(&mut app, enumerate_created);
+        app.create = fake_create_fails;
+        app.on_key(key(KeyCode::Char('n')));
+
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::NewSession, "留在向导里");
+        let draft = app.draft.as_ref().expect("draft kept");
+        assert_eq!(draft.focus, NewField::Name, "焦点不动");
+        let error = draft.error.as_deref().unwrap_or_default();
+        assert!(error.contains("already exists"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn duplicate_name_gets_a_note_but_is_allowed() {
         let mut app = app_with(FOUR); // 含 work / llm / dep / legacy
         app.open_new_session();
-        app.draft.as_mut().unwrap().name = "work".into();
+        let draft = app.draft.as_mut().unwrap();
+        draft.name = "work".into();
+        draft.name_edited = true; // 手打的 → 只提示，不自动改名
 
-        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Tab));
         let draft = app.draft.as_ref().unwrap();
-        assert_eq!(draft.step, NewStep::Dir, "duplicate does not block");
+        assert_eq!(draft.focus, NewField::Dir, "Tab 只是切焦点，重名不拦路");
         assert!(draft.error.is_none());
         let note = draft.note.as_deref().expect("duplicate note set");
         assert!(note.contains("<pid>.work"), "{note}");
@@ -2137,12 +2715,12 @@ mod tests {
         let mut app = app_with(FOUR);
         app.open_new_session();
         let draft = app.draft.as_mut().unwrap();
-        draft.step = NewStep::Dir;
+        draft.focus = NewField::Dir;
         draft.dir = "/no/such/dir/stui-test".into();
 
         app.on_key(key(KeyCode::Enter));
         let draft = app.draft.as_ref().unwrap();
-        assert_eq!(draft.step, NewStep::Dir);
+        assert_eq!(draft.focus, NewField::Dir);
         assert!(
             draft
                 .error
@@ -2951,7 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn wizard_dir_step_lists_recent_and_digits_pick() {
+    fn wizard_dir_field_lists_recent_and_digits_pick() {
         let (mut app, dir) = app_with_config_dir("wizard");
         let real_dir = dir.display().to_string();
         // 入库顺序决定展示顺序：最近的在前。
@@ -2959,9 +3537,9 @@ mod tests {
         app.config.touch_dir("/nonexistent-for-test");
 
         app.on_key(key(KeyCode::Char('n')));
-        app.on_key(key(KeyCode::Enter)); // 名字默认 → 目录步
+        app.on_key(key(KeyCode::Tab)); // 焦点切到目录字段
         let draft = app.draft.as_ref().unwrap();
-        assert_eq!(draft.step, NewStep::Dir);
+        assert_eq!(draft.focus, NewField::Dir);
         assert_eq!(
             draft.recent,
             vec!["/nonexistent-for-test".to_string(), real_dir.clone()]
@@ -2971,9 +3549,9 @@ mod tests {
         app.on_key(key(KeyCode::Char('9')));
         assert!(app.draft.as_ref().unwrap().dir.ends_with('9'));
 
-        // 数字 2 → 直选 real_dir（存在）并推进到命令步。
+        // 数字 2 → 直选 real_dir 填入，焦点不动（表单没有「下一步」了）。
         app.on_key(key(KeyCode::Char('2')));
-        assert_eq!(app.draft.as_ref().unwrap().step, NewStep::Command);
+        assert_eq!(app.draft.as_ref().unwrap().focus, NewField::Dir);
         assert_eq!(app.draft.as_ref().unwrap().dir, real_dir);
 
         let _ = std::fs::remove_dir_all(&dir);

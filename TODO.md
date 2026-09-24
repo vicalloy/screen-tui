@@ -43,10 +43,10 @@
 
 | # | 子任务 | 验收 |
 |---|---|---|
-| 1.4a | `NewSession(NewDraft)` 三步向导（名 → 目录 → 命令），默认值自动生成 `目录名-MMDD-HHMM`，回车即接受（FR-02 验收 1） | 向导状态机单测（纯逻辑） |
-| 1.4b | 名字校验：非法字符 / 超长即时报错；重名**允许创建**但提示「将以 `<pid>.<name>` 寻址」（FR-02 验收 2） | 校验规则单测 |
+| 1.4a | `NewSession(NewDraft)` 向导（名字步 / 目录步 / 命令步），名字默认取当前目录名、重名依次追加数字，回车即接受（FR-02 验收 1/6） | 向导状态机单测（纯逻辑） |
+| 1.4b | 名字校验：非法字符 / 超长即时报错；重名**允许创建**但提示「将以 `<pid>.<name>` 寻址」；自动加数字只作用于未编辑过的默认名（FR-02 验收 2） | 校验规则单测 |
 | 1.4c | `screen::cmd` 增加 `create(name, dir, command)`：`screen -U -dmS <name> <command>`，创建前 `cd` 到目标目录（子进程 cwd）实现「显式设置工作目录」；`screen-256color` terminfo 可用时为子进程设置 `TERM` | **`STUI_SCREEN` 替身测试**创建参数拼装正确；不真创建会话 |
-| 1.4d | 错误路径：screen 缺失 / 目录不可写 / 创建失败 → 可行动报错，不静默；成功后回列表并选中新会话（FR-02 验收 4/5） | 替身注入失败退出码走通报错路径 |
+| 1.4d | 错误路径：screen 缺失 / 目录不可写 / 创建失败 → 可行动报错，不静默；成功后按 `attach_after_create` 直接进入新会话（默认）或停留列表选中新会话（FR-02 验收 4/5） | 替身注入失败退出码走通报错路径 |
 
 ### T1.5 连接闭环（编码可先行，**实机验收依赖 T0.6**）
 
@@ -210,5 +210,68 @@ T2.2 probe ── T2.5 过滤/详情
 5. `s` 重启：dead managed 会话重建后旧 dead socket 的处理（是否需要先 wipe）。
 6. FR-18：`.screenrc` 含 `escape` 行时 detach 提示前缀是否符合用户实际配置。
 7. 手机尺寸下 M2 全部新键位（1-9 / x / p / D / K / r / W / s / X / /）的可用性走查。
+
+---
+
+# 跟进：新建流程简化（2026-09-24 定稿并完成编码）
+
+- 背景：`n` 新建需逐个回车通过三步，最少 4 次按键；默认值被当成待批准的表单，而不是已采纳的事实。
+- 依据：`design/requirements.md` FR-02 验收 1–8、`design/tech-design.md` §2.1
+- 口径变更：默认名改为 `目录名` + 重名追加数字（原 `目录名-MMDD-HHMM`）；创建后默认直接进入会话（原停留列表）；命令留空由「报错」改为「落回默认 shell」
+- 已定细节：后缀形态 `work2`（无分隔符）；第二个动作用 `Tab`；占用判定含配置里的留档名；后两步 `Esc` 回上一步
+- 横切约定沿用：每任务一提交、CI 三门禁、替身注入可测、禁止 `stuff`
+
+| # | 子任务 | 验收 |
+|---|---|---|
+| 1.6a | `base_name(dir)` + `next_free_name(base, taken)` 两个纯函数；清洗补前导 `-` / 前导 `.` / 控制字符，截断到 `NAME_MAX` 且不占后缀空间；`taken` = 活跃会话名（含 dead）∪ 配置留档名 | 纯函数单测：`work`→`work2`→`work3`、`-foo`、`.config`、超长截断、后缀打满退回基名 |
+| 1.6b | 单表单弹层：Name / Directory / Command 三字段同屏；`Tab`/`↓` 向后、`↑`/Shift+`Tab` 向前循环切焦点；`Enter` 任意字段校验并创建（失败焦点跳到第一个出错字段）；`Esc` 任意字段取消；目录字段聚焦且收藏非空时 `1`–`9` 直选填入 | 状态机单测 + TestBackend 渲染断言 |
+| 1.6c | 提交前若名字仍是未编辑的默认名则重新枚举定名（NFR-08 口径），仍空闲则保留用户看到的名字，状态行注明改名来源 | 替身测试：被占 → 换后缀；空闲 → 不动 |
+| 1.6d | 接线 `defaults.attach_after_create`（默认翻 `true`）：创建成功 → 既有 `plan_connect()`；新会话不在枚举结果里、或同名会话多于一条时都不自动进入，只在状态行说明原因 | 三条路径单测（`true` 进入 / 查无此会话 / 同名两条） |
+| 1.6e | 命令留空落回默认 shell；`App` 增加可注入的 `create`，单测不再可能真的起 screen | 空命令单测 + 失败路径保留草稿单测 |
+
+## 已同步调整的既有测试
+
+`wizard_opens_with_prefilled_defaults`（默认名规则）、`wizard_advances_through_valid_steps` → `wizard_tab_advances_through_steps`、
+`wizard_esc_cancels_and_returns_to_list` → `wizard_esc_cancels_from_the_name_step`、
+`duplicate_name_gets_a_note_but_is_allowed`、`wizard_dir_step_lists_recent_and_digits_pick`、
+`ui::new_session_wizard_renders_steps_input_and_error`。
+
+## 不在本次范围
+
+- `stui new` 非交互子命令
+- 可配置的命名模板（`defaults.name_template`）
+- 把已存在的 `attach_after_create: false` 配置迁移成新默认值（配置值优先，见下）
+
+## 追加：单表单改版（同日定稿，替代「三步 + Tab 前进」交互）
+
+编码完成后用户复核交互，改版口径（Q&A 已确认）：
+
+- 不再用 `Tab` 逐步前进：`Tab`/`↓` 向后、`↑`/Shift+`Tab` 向前，在 Name / Dir / Cmd 三字段间**循环**切焦点
+- `Enter` 在任意字段直接校验并创建；失败时焦点跳到第一个出错字段
+- `Esc` 在任意字段取消（原「后两步回上一步」作废）
+- 目录字段聚焦且收藏列表非空时保留 `1`–`9` 直选，选中即填入、焦点不动（不再跳步）
+- 实现侧：`NewStep` 改名 `NewField`（步骤 → 焦点语义），`escape_new`/`enter_new`/`tab_new`/`advance_new` 收敛为 `cancel_new`/`commit_new`/`cycle_focus`
+
+## 状态
+
+- [x] 文档口径已落（2026-09-24）
+- [x] 1.6a–1.6e 编码（155 tests / fmt / clippy 全绿）
+- [x] 单表单改版编码（同日）
+- [ ] 实机走查（随 T0.6 一并做：`n` → `Enter` 直接建好并进入；`Tab`/`↑↓` 三字段循环；校验失败焦点跳转）
+
+## 自查中拦下的一个错误
+
+1.6d 最初写成「按名字进入」，这在**同名多条**时会静默进入错的会话：`unambiguous_target` 取列表里先出现的同名项，
+那可能是一个早就存在的会话。现在 `auto_enter_created()` 先数一遍列表里同名条目，只有**恰好一条**才走 `plan_connect()`。
+
+## 已知边界与遗留
+
+1. **改了默认值，但不改已有配置文件。** 老用户的 `config.json` 里写着 `"attach_after_create": false`，
+   序列化会写全字段，所以这个值会一直留在文件里并**优先于新默认值**。想要新行为得手工把它改成 `true` 或删掉该键。
+   （本机 `~/.config/screen-tui/config.json` 正是这种状态。）
+2. **`util::time::local_label` 已删除**：它只服务于旧的 `目录名-MMDD-HHMM` 命名，去掉时间戳后就没有调用方了，
+   留着会撞 CI 的 `clippy -D warnings`（dead_code）。
+3. 顺带修掉一处既有缺陷：创建成功后的状态消息原先在 `refresh()` 之前设置，而 `refresh()` 成功会清空 `status`，
+   导致 `created '...'` 从未真正显示过。现在改成先刷新再落账。
 
 

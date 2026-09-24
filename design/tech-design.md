@@ -51,7 +51,7 @@
 enum Mode {
     List,                      // 主列表（默认轮询）
     Filter,                    // / 输入过滤词
-    NewSession(NewDraft),      // n 新建（name → dir → command 三步）
+    NewSession(NewDraft),      // n 新建（单表单：Tab/↑↓ 切字段，Enter 创建，Esc 取消）
     Rename,                    // r 重命名
     Confirm(ConfirmAction),    // kill / wipe / detach 的二次确认
     AttachChoice,              // attached 会话的 共享/接管/取消
@@ -62,6 +62,8 @@ enum Mode {
 ```
 
 `Mode` 之间只通过显式事件转换；`Esc` 统一回退上一层，`q` 在 `List` 才退出。渲染层只读 `App`，不改变它 —— 保证任何绘制路径都不能引入副作用。
+
+`NewSession` 是单层表单，没有「上一步」：三个字段靠 `Tab`/`↓`/`↑` 循环切换焦点，`Esc` 在任意字段直接取消整个向导回列表 —— 即 FR-02 验收 6 的口径。
 
 ### 2.2 事件循环（无 async）
 

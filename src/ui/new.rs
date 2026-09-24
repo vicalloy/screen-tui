@@ -1,19 +1,22 @@
-//! 新建会话三步向导的渲染（FR-02）。
+//! 新建会话表单的渲染（FR-02）。
 //!
-//! 纯函数绘制：只读 `NewDraft`，输入回显加块状光标 `▏`；
-//! 错误（阻断）红色、提示（重名等非阻断）黄色，多行错误按行数撑高弹层。
+//! 纯函数绘制：只读 `NewDraft`。三字段同屏 —— 焦点字段回显块状光标 `▏`，
+//! 其余字段暗色整行；错误（阻断）红色、提示（重名等非阻断）黄色，多行按行数撑高弹层。
 
 use ratatui::Frame;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{NewDraft, NewStep};
+use crate::app::{NewDraft, NewField};
 use crate::ui::{centered_rect, theme};
+use crate::util::width::clip_with_ellipsis;
 
 const BOX_WIDTH: u16 = 58;
-/// 固定内容：步骤指示 + 空行 + 输入行 + 状态行 + 空行 + 按键提示。
-const BASE_CONTENT: u16 = 6;
+/// 边框内的可用列数（`Block::bordered()` 左右各占一列）。
+const INNER_WIDTH: usize = BOX_WIDTH as usize - 2;
+/// 固定内容：焦点指示 + 空行 + 三字段行 + 状态行 + 空行 + 按键提示。
+const BASE_CONTENT: u16 = 8;
 
 pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
     let message_lines = draft
@@ -22,8 +25,8 @@ pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
         .map(|e| e.lines().count())
         .or_else(|| draft.note.as_ref().map(|n| n.lines().count()))
         .unwrap_or(0) as u16;
-    // 目录步加收藏列表（T2.7）：标题行 + 每条目录一行。
-    let recent_lines = if draft.step == NewStep::Dir {
+    // 目录字段聚焦时展示收藏列表（T2.7）：标题行 + 每条目录一行。
+    let recent_lines = if draft.focus == NewField::Dir && !draft.recent.is_empty() {
         draft.recent.len() as u16 + 1
     } else {
         0
@@ -31,25 +34,15 @@ pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
     let height = BASE_CONTENT + message_lines + recent_lines + 2; // + 边框
     let area = centered_rect(f.area(), BOX_WIDTH, height);
 
-    let mut lines = vec![steps_indicator(draft), Line::from("")];
-    lines.push(input_line(draft));
-    if draft.step == NewStep::Dir && !draft.recent.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " Recent (1-9 to pick):".to_string(),
-            theme::dimmed(),
-        )));
-        for (idx, path) in draft.recent.iter().enumerate() {
-            lines.push(Line::from(Span::styled(
-                format!("  {} {}", idx + 1, path),
-                theme::dimmed(),
-            )));
-        }
+    let mut lines = vec![focus_indicator(draft), Line::from("")];
+    for field in [NewField::Name, NewField::Dir, NewField::Command] {
+        lines.push(field_line(draft, field));
     }
     match (&draft.error, &draft.note) {
         (Some(error), _) => {
             for line in error.lines() {
                 lines.push(Line::from(Span::styled(
-                    line.to_string(),
+                    clip_with_ellipsis(line, INNER_WIDTH),
                     Style::default().fg(ratatui::style::Color::Red),
                 )));
             }
@@ -57,7 +50,7 @@ pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
         (None, Some(note)) => {
             for line in note.lines() {
                 lines.push(Line::from(Span::styled(
-                    line.to_string(),
+                    clip_with_ellipsis(line, INNER_WIDTH),
                     Style::default().fg(ratatui::style::Color::Yellow),
                 )));
             }
@@ -65,10 +58,9 @@ pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
         (None, None) => lines.push(Line::from("")),
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Enter next/commit · Esc cancel".to_string(),
-        theme::dimmed(),
-    )));
+    lines.push(dimmed_line(
+        " Tab/↓ next · ↑ back · Enter create · Esc cancel",
+    ));
 
     f.render_widget(Clear, area);
     f.render_widget(
@@ -77,13 +69,13 @@ pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
     );
 }
 
-/// `[1 Name]  2 Directory  3 Command` —— 当前步加粗，其余暗色。
-fn steps_indicator(draft: &NewDraft) -> Line<'static> {
-    let all = [NewStep::Name, NewStep::Dir, NewStep::Command];
+/// 焦点指示：`[1 Name]  2 Directory  3 Command` —— 焦点字段加粗，其余暗色。
+fn focus_indicator(draft: &NewDraft) -> Line<'static> {
+    let all = [NewField::Name, NewField::Dir, NewField::Command];
     let mut spans = Vec::with_capacity(all.len());
-    for step in all {
-        let text = format!("{} {}", step.index() + 1, step.label());
-        if step == draft.step {
+    for field in all {
+        let text = format!("{} {}", field.index() + 1, field.label());
+        if field == draft.focus {
             spans.push(Span::styled(
                 format!("[{text}]"),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -95,19 +87,38 @@ fn steps_indicator(draft: &NewDraft) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 当前步的输入回显 + 块状光标。
-fn input_line(draft: &NewDraft) -> Line<'static> {
-    let (label, value) = match draft.step {
-        NewStep::Name => ("Name", &draft.name),
-        NewStep::Dir => ("Directory", &draft.dir),
-        NewStep::Command => ("Command", &draft.command),
+/// 字段行：标签右对齐到同一列；焦点字段加粗并带块状光标，其余整行暗色。
+fn field_line(draft: &NewDraft, field: NewField) -> Line<'static> {
+    let (label, value) = match field {
+        NewField::Name => ("Name", &draft.name),
+        NewField::Dir => ("Directory", &draft.dir),
+        NewField::Command => ("Command", &draft.command),
     };
-    Line::from(vec![
-        Span::styled(
-            format!(" {label}: "),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(value.clone()),
-        Span::styled("▏", Style::default().add_modifier(Modifier::BOLD)),
-    ])
+    // ` label: ` 前缀按最长的 Directory（9 列）对齐，块状光标再占一列。
+    let prefix_cols = 1 + NewField::Dir.label().len() + 2;
+    let value_cols = INNER_WIDTH.saturating_sub(prefix_cols + 1);
+    let label = format!("{label:>9}:");
+    if field == draft.focus {
+        Line::from(vec![
+            Span::styled(
+                format!(" {label} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(clip_with_ellipsis(value, value_cols)),
+            Span::styled("▏", Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            clip_with_ellipsis(&format!(" {label} {value}"), INNER_WIDTH),
+            theme::dimmed(),
+        ))
+    }
+}
+
+/// 按弹层内宽裁剪的一行暗色文本（NFR-06：行长钳制，不交给终端换行）。
+fn dimmed_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        clip_with_ellipsis(text, INNER_WIDTH),
+        theme::dimmed(),
+    ))
 }

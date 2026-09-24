@@ -62,7 +62,8 @@ impl Default for UiConfig {
 pub struct Defaults {
     pub use_utf8: bool,
     pub prefer_256color: bool,
-    /// 创建成功后是否直接连接进去（FR-02 验收 4 的可配置项；默认停留列表）。
+    /// 创建成功后是否直接连接进去（FR-02 验收 4；默认**直接进入**）。
+    /// 置 `false` 则停留列表并选中新会话。
     pub attach_after_create: bool,
     /// 返回提示用的转义前缀。`None` = 自动探测 `.screenrc`（FR-18），
     /// 探测不到再回退 `C-a`；显式设置则覆盖探测结果。
@@ -74,7 +75,7 @@ impl Default for Defaults {
         Self {
             use_utf8: true,
             prefer_256color: true,
-            attach_after_create: false,
+            attach_after_create: true,
             escape_prefix: None,
         }
     }
