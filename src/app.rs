@@ -911,8 +911,11 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             // 手动刷新：窗口数缓存一并作废（FR-17 修订「除非手动刷新」），
             // 自动轮询计时由 refresh() 内统一更新的 last_refresh 重置。
+            // 预览同步刷新（FR-15 修订）：作废去重标记，下一轮事件循环的
+            // wide_preview_due 会对选中会话重新抓快照（宽屏右栏常驻预览）。
             KeyCode::Char('R') => {
                 self.window_count_cache = None;
+                self.last_preview_target = None;
                 self.refresh();
             }
             // 过滤（FR-16）：输入即筛，Esc 清空。
@@ -3719,6 +3722,27 @@ mod tests {
             app.wide_preview_due(true).is_some(),
             "cleared target retries"
         );
+    }
+
+    #[test]
+    fn manual_refresh_invalidates_preview_target_for_refetch() {
+        let mut app = app_with(FOUR);
+        app.caps.hardcopy = crate::screen::caps::Support::Yes;
+        app.selected = 0;
+
+        // 首次自动抓取后，同一会话不再重复抓。
+        assert!(app.wide_preview_due(true).is_some());
+        assert!(app.wide_preview_due(true).is_none());
+
+        // R 手动刷新：作废去重标记 → 下一轮 wide_preview_due 重新抓选中会话。
+        // refresh 走替身 —— 列表保持 FOUR，不跑真实 screen -ls。
+        app.enumerate = fake_enumerate;
+        app.on_key(key(KeyCode::Char('R')));
+        let request = app
+            .wide_preview_due(true)
+            .expect("R must trigger preview refetch");
+        assert!(!request.manual, "R refreshes the pane, not the popup");
+        assert_eq!(request.full, "12347.dep"); // FOUR 排序后第 0 行是 dep
     }
 
     // ------------------------------------------------------------- T2.6 元数据持久化
