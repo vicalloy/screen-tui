@@ -286,6 +286,16 @@ fn render_confirm(f: &mut Frame<'_>, confirm: &crate::app::ConfirmAction) {
     if let Some(command) = &confirm.command {
         lines.push(Line::from(crate::i18n::fmt(t.confirm_command, &[command])));
     }
+    // 强制终止警示（FR-13 验收 5 v0.2 修订）：attached 会话的 kill 确认框
+    // 必须让用户看到"会断开对端"再决定。
+    if confirm.force_kill {
+        lines.push(Line::from(Span::styled(
+            crate::i18n::fmt(t.confirm_kill_force, &[&confirm.display]),
+            Style::default()
+                .fg(ratatui::style::Color::Red)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )));
+    }
     lines.push(Line::from(""));
 
     // 焦点用反显标出：Enter 执行的是焦点项，所以焦点必须一眼可辨。

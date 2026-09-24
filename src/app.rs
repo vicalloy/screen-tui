@@ -275,6 +275,9 @@ pub struct ConfirmAction {
     pub display: String,
     /// 探测到的运行命令（FR-13 验收 2：让用户确认杀对了对象）。
     pub command: Option<String>,
+    /// 强制终止标记（FR-13 验收 5 v0.2 修订）：目标在确认框打开时是 attached/multi，
+    /// 用户已被告知强制终止会断开对端。执行前复核凭它放行 attached 会话。
+    pub force_kill: bool,
     /// 当前焦点：`true` = 确认键。**初始恒为 false（取消）**。
     pub focus_yes: bool,
 }
@@ -1318,6 +1321,7 @@ impl App {
             target: String::new(),
             display: crate::i18n::fmt(crate::i18n::t().stale_entries, &[&count.to_string()]),
             command: Some(stale.join(", ")),
+            force_kill: false,
             focus_yes: false,
         });
         self.mode = Mode::Confirm;
@@ -1444,6 +1448,7 @@ impl App {
                     target: String::new(),
                     display: crate::i18n::t().dead_sessions_display.into(),
                     command: None,
+                    force_kill: false,
                     focus_yes: false, // 默认焦点在取消（FR-13 验收 1）。
                 });
             }
@@ -1461,19 +1466,9 @@ impl App {
                     ));
                     return;
                 }
-                // attached/multi 的会话不允许 kill：会话正被别的终端使用，
-                // 直接 quit 会把对端连人带会话一起砍掉 —— 先断开再杀（v0.2 修订）。
-                if kind == ActionKind::Kill
-                    && matches!(session.status, Status::Attached | Status::Multi)
-                {
-                    self.set_error(crate::i18n::fmt(
-                        crate::i18n::t().kill_attached,
-                        &[&session.name],
-                    ));
-                    return;
-                }
                 // 自身所在的会话不允许 kill（FR-13 v0.2 修订）：stui 就跑在里面，
                 // quit 等于把自己脚下的地板拆掉 —— 与状态无关，$STY 匹配即拒绝。
+                // 必须在 attached 判断之前：自身会话必然 attached，否则会被误导向强制终止。
                 if kind == ActionKind::Kill && self.is_self_session(&session.full) {
                     self.set_error(crate::i18n::fmt(
                         crate::i18n::t().kill_self,
@@ -1481,11 +1476,16 @@ impl App {
                     ));
                     return;
                 }
+                // attached/multi → 强制终止确认框（FR-13 验收 5 v0.2 修订）：
+                // 不再直接拒绝 —— 弹确认框并告知会断开对端，用户确认后照杀。
+                let force_kill = kind == ActionKind::Kill
+                    && matches!(session.status, Status::Attached | Status::Multi);
                 self.confirm = Some(ConfirmAction {
                     kind,
                     target: session.full.clone(),
                     display: session.name.clone(),
                     command: self.meta.as_ref().and_then(|m| m.command.clone()),
+                    force_kill,
                     focus_yes: false,
                 });
             }
@@ -1576,8 +1576,11 @@ impl App {
                     ));
                 }
                 match found {
-                    // attached/multi 拒绝 kill（新鲜状态复核，v0.2 修订）：会话正被
-                    // 别的终端使用，-X quit 会连人带会话一起砍掉 —— 先断开再杀。
+                    // 强制终止（确认框已告知会断开对端，FR-13 验收 5 v0.2 修订）：
+                    // attached/multi 照杀 —— screen -X quit 会连对端一起结束。
+                    Some(Status::Attached | Status::Multi) if action.force_kill => Ok(()),
+                    // 竞态：确认框打开时还是 detached，执行前被别的终端接管。
+                    // 用户没确认过强制终止 → 拒绝，按 K 重开确认框可走强制路径。
                     Some(Status::Attached | Status::Multi) => Err(crate::i18n::fmt(
                         crate::i18n::t().kill_attached,
                         &[&action.display],
@@ -3160,6 +3163,7 @@ mod tests {
             target: full.into(),
             display: full.split('.').nth(1).unwrap_or(full).into(),
             command: None,
+            force_kill: false,
             focus_yes: false,
         }
     }
@@ -3245,37 +3249,57 @@ mod tests {
     }
 
     #[test]
-    fn kill_entry_is_refused_for_attached_sessions() {
+    fn kill_entry_opens_force_confirm_for_attached_sessions() {
         let mut app = app_with(FOUR);
         app.selected = 2; // llm（Attached）
         app.on_key(key(KeyCode::Char('K')));
-        // v0.2 修订：attached 会话不允许 kill —— 错误弹层，不出确认框。
-        assert_eq!(app.mode, Mode::Error);
-        assert!(app.take_action().is_none());
-        let message = app
-            .error_dialog
-            .as_deref()
-            .unwrap_or_default();
-        assert!(message.contains("kill refused"), "{message}");
+        // v0.2 修订：attached 会话不再直接拒绝 —— 打开强制终止确认框
+        //（默认焦点仍在取消，FR-13），用户确认后照杀。
+        assert_eq!(app.mode, Mode::Confirm);
+        let confirm = app.confirm.as_ref().unwrap();
+        assert_eq!(confirm.kind, ActionKind::Kill);
+        assert!(confirm.force_kill, "attached kill must be marked force");
+        assert!(!confirm.focus_yes, "default focus must be cancel (FR-13)");
 
-        // 确认弹层后回到列表，界面仍可用。
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.mode, Mode::List);
+        // 自身所在的会话仍然直接拒绝（kill_self），即使它必然 attached。
+        let mut app = app_with(
+            "There is a screen on:\n\t12346.llm\t(09/23/2026 10:00:00 AM)\t(Attached)\n1 Socket in /tmp/.screen.\n",
+        );
+        app.self_sty = Some("12346.llm".into());
+        app.selected = 0;
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(app.mode, Mode::Error, "self session must be refused");
+        assert!(app.take_action().is_none());
+        assert!(
+            app.error_dialog
+                .as_deref()
+                .unwrap_or_default()
+                .contains("you are inside"),
+            "self refusal must win over force-kill dialog"
+        );
     }
 
     #[test]
-    fn validate_action_refuses_kill_of_attached_session_with_fresh_state() {
+    fn validate_action_allows_force_kill_of_attached_session() {
         let mut app = app_with(FOUR);
-        // 键位时刻目标还是 detached（确认框放行），执行前新鲜 -ls 显示已被
-        // 别的终端接管 → 必须拒绝，防止把对端连人带会话一起砍掉。
+        // 强制终止（确认框已告知会断开对端）：执行前新鲜 -ls 仍是 attached → 放行。
+        let mut action = confirm_action(ActionKind::Kill, "12345.work");
+        action.force_kill = true;
+        let fresh = enumeration(
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Attached)\n1 Socket in /tmp/.screen.\n",
+        );
+        assert!(app.validate_action(fresh, &action).is_ok());
+
+        // 竞态：确认框打开时 detached（force_kill=false），执行前被接管 → 拒绝，
+        // 提示再按 K 走强制路径。
         let action = confirm_action(ActionKind::Kill, "12345.work");
         let fresh = enumeration(
             "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Attached)\n1 Socket in /tmp/.screen.\n",
         );
         let err = app
             .validate_action(fresh, &action)
-            .expect_err("attached kill must be refused");
-        assert!(err.contains("kill refused"), "{err}");
+            .expect_err("non-force kill of attached must be refused");
+        assert!(err.contains("force kill"), "{err}");
     }
 
     #[test]
