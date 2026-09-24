@@ -504,6 +504,14 @@ fn header_widget(app: &App) -> Paragraph<'static> {
             theme::dimmed(),
         ));
     }
+    // 自身就在某个 screen 会话里（FR-03 验收 5 v0.2 修订）：页眉常驻徽标。
+    // 展示 socket 名 —— 与列表里 `@` 标记的会话相互印证。
+    if let Some(sty) = &app.self_sty {
+        line.push(Span::styled(
+            crate::i18n::fmt(crate::i18n::t().header_self, &[sty]),
+            Style::default().fg(ratatui::style::Color::Cyan),
+        ));
+    }
     Paragraph::new(Line::from(line))
 }
 
@@ -530,6 +538,11 @@ fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
         Line::from(vec![help_key("R"), help_desc(t.desc_refresh)]),
         Line::from(vec![help_key("q / Esc"), help_desc(t.desc_quit)]),
         Line::from(""),
+        // 图例：列表里的 `@` 标记（FR-03 验收 5 v0.2 修订）。
+        Line::from(Span::styled(
+            format!(" @ {}", t.desc_self_marker),
+            Style::default().fg(ratatui::style::Color::Cyan),
+        )),
         Line::from(Span::styled(
             format!(
                 "screen {}",

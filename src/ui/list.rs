@@ -51,6 +51,8 @@ fn created_display(created: &str) -> String {
 
 /// 装配一行。`name_budget` 由调用方按宽度算好；此处不做溢出保护之外的布局决策。
 /// `alias` 是 T2.6 的自定义别名（宽/中屏显示，窄屏随信息分级隐藏）。
+/// `is_self`：stui 自身就跑在这个会话里（`$STY` 匹配）—— 名字尾部标 `@`，
+/// 标记宽度在名字预算内预留，左右各列对齐不受影响。
 fn row_line(
     idx: usize,
     session: &SessionRecord,
@@ -58,6 +60,7 @@ fn row_line(
     name_budget: usize,
     cols: RowCols,
     alias: Option<&str>,
+    is_self: bool,
 ) -> Line<'static> {
     let base: Style = if selected {
         theme::selected_row()
@@ -82,12 +85,25 @@ fn row_line(
 
     // 名字：控制字符消毒 → 按显示宽度裁剪 → 补齐到预算（对齐右侧各列）。
     // 别名跟在名字后面（同一名字预算内截断，绝不挤占序号与状态列）。
+    // 自身会话在名字预算尾部留 2 列给 ` @`，非自身行等宽 pad，PID 列不漂移。
     let name = match alias {
         Some(a) if !a.is_empty() => format!("{} · {}", sanitize(&session.name), sanitize(a)),
         _ => sanitize(&session.name),
     };
-    let name = clip_with_ellipsis(&name, name_budget);
-    spans.push(Span::raw(pad_right(&name, name_budget)));
+    if is_self {
+        let avail = name_budget.saturating_sub(2);
+        let name = clip_with_ellipsis(&name, avail);
+        spans.push(Span::raw(pad_right(&name, avail)));
+        spans.push(Span::styled(
+            " @".to_string(),
+            Style::default()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+    } else {
+        let name = clip_with_ellipsis(&name, name_budget);
+        spans.push(Span::raw(pad_right(&name, name_budget)));
+    }
 
     if cols.status_text {
         // pad 到固定列宽：PID 起始列不随状态文字长度漂移（也不与 PID 贴死）。
@@ -148,7 +164,15 @@ pub fn render(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, tier: Tier) {
             } else {
                 None
             };
-            row_line(idx, session, idx == app.selected, budget, cols, alias)
+            row_line(
+                idx,
+                session,
+                idx == app.selected,
+                budget,
+                cols,
+                alias,
+                app.is_self_session(&session.full),
+            )
         })
         .collect();
     f.render_widget(Paragraph::new(lines), area);

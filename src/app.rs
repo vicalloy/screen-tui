@@ -462,6 +462,10 @@ pub struct App {
     pub escape_prefix: Option<String>,
     /// 过滤查询词（FR-16）。空串 = 不过滤；refresh 不重置它。
     pub filter: String,
+    /// stui 自身所在 screen 会话的 socket 名（`$STY`，如 `27099.screen-tui`）；
+    /// 不在 screen 内为 `None`。与 `-ls` 的 `<pid>.<name>`（`full`）精确对应，
+    /// 用于页眉徽标 + 列表标记 + 拒绝连进自身（FR-03 验收 5 v0.2 修订）。
+    pub self_sty: Option<String>,
     /// 选中会话的窗口数（`-Q windows`，FR-17）。能力不可用/未知时恒为 `None` → UI 隐藏。
     ///
     /// 懒获取：详情可见时才查（[`App::ensure_window_count`]），带 10s TTL 缓存 ——
@@ -558,6 +562,7 @@ impl App {
             rename: None,
             escape_prefix: None,
             filter: String::new(),
+            self_sty: None,
             window_count: None,
             window_count_cache: None,
             preview: None,
@@ -591,6 +596,12 @@ impl App {
             .filter(|s| self.matches_filter(s))
             .cloned()
             .collect()
+    }
+
+    /// stui 是否正运行在该会话里：`$STY` 与 `-ls` 的全名（`<pid>.<name>`）精确比对。
+    /// 两者同源（socket 名），无歧义；匿名会话两侧同样是 `<pid>.<tty>` 形式。
+    pub fn is_self_session(&self, full: &str) -> bool {
+        self.self_sty.as_deref() == Some(full)
     }
 
     /// 全量会话（不过滤）。
@@ -791,8 +802,18 @@ impl App {
                     .sessions
                     .iter()
                     .find(|s| s.name == name)
-                    .map(|s| s.status.clone());
+                    .map(|s| (s.full.clone(), s.status.clone()));
                 self.apply_enumeration(fresh);
+                // 自身所在会话：-x 同样被 screen 拒绝（已在会话内），提前拦下。
+                if status
+                    .as_ref()
+                    .map(|(full, _)| self.is_self_session(full))
+                    .unwrap_or(false)
+                {
+                    self.set_error(crate::i18n::fmt(crate::i18n::t().attach_self, &[&name]));
+                    return;
+                }
+                let status = status.map(|(_, status)| status);
                 match status {
                     Some(Status::Dead | Status::Unreachable) => {
                         self.set_error(crate::i18n::fmt(
@@ -957,12 +978,29 @@ impl App {
             return;
         };
         // 先取走需要的信息再消费 fresh，避免借用冲突。
-        let fresh_status = fresh
+        let fresh_entry = fresh
             .list
             .sessions
             .iter()
             .find(|s| s.name == name)
-            .map(|s| s.status.clone());
+            .map(|s| (s.full.clone(), s.status.clone()));
+        let fresh_full = fresh_entry.as_ref().map(|(full, _)| full.clone());
+        let fresh_status = fresh_entry.map(|(_, status)| status);
+
+        // stui 自己就跑在这个会话里：screen 拒绝从自身内部 attach，
+        // 提前拦下，不浪费一次注定失败的 exec（FR-03 验收 5 v0.2 修订）。
+        if fresh_full
+            .as_deref()
+            .map(|full| self.is_self_session(full))
+            .unwrap_or(false)
+        {
+            self.set_error(crate::i18n::fmt(
+                crate::i18n::t().attach_self,
+                &[&name],
+            ));
+            self.apply_enumeration(fresh);
+            return;
+        }
 
         match fresh_status {
             None => {
@@ -2088,10 +2126,10 @@ pub fn run(initial_error: Option<String>) -> u8 {
         Some(explicit) => Some(explicit),
         None => detect_escape_prefix(),
     };
-    // $STY 非空 = 已经在一个 screen 会话里（FR-03 验收 5）：警告一次，不阻塞。
-    if std::env::var("STY").map(|v| !v.is_empty()).unwrap_or(false) {
-        app.status = Some(crate::i18n::t().inside_sty.into());
-    }
+    // $STY 非空 = stui 自身运行在某个 screen 会话里（FR-03 验收 5 v0.2 修订）：
+    // socket 名存入 self_sty —— 页眉常驻徽标 + 列表 `@` 标记 + 拒绝连进自身，
+    // 比一次性页脚警告可靠（refresh 会清瞬态消息）。
+    app.self_sty = std::env::var("STY").ok().filter(|v| !v.is_empty());
     app.refresh();
     // 配置警告在首帧后给出（refresh 会清瞬态消息，这条必须在它之后落）。
     if !loaded.warnings.is_empty() {
