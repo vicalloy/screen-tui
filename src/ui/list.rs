@@ -20,8 +20,10 @@ use crate::util::width::{clip_with_ellipsis, pad_right, sanitize};
 
 /// 行前缀固定开销（列）：光标 1 + 空格 1 + 序号 2 + 空格 1 + 图标 1 + 空格 1。
 const PREFIX_COLS: usize = 7;
-/// 状态文字（含前导空格）预留的最大显示宽度。
-const STATUS_SUFFIX_COLS: usize = 13;
+/// 状态文字（含前导空格）预留的最大显示宽度。状态按显示宽度 pad 到
+/// `STATUS_SUFFIX_COLS - 1` 列再接后续列，保证 PID 起始列固定（最长标签
+/// `unreachable` 11 列 + 至少 2 空格间隔 → 14）。
+const STATUS_SUFFIX_COLS: usize = 14;
 /// PID 列（含前导空格，按 7 位数字预留）。
 const PID_COLS: usize = 8;
 /// 创建时间列（含前导空格，`MM/DD/YYYY HH:MM`）。
@@ -88,7 +90,9 @@ fn row_line(
     spans.push(Span::raw(pad_right(&name, name_budget)));
 
     if cols.status_text {
+        // pad 到固定列宽：PID 起始列不随状态文字长度漂移（也不与 PID 贴死）。
         let label = clip_with_ellipsis(&session.status.label(), STATUS_SUFFIX_COLS - 1);
+        let label = pad_right(&label, STATUS_SUFFIX_COLS - 1);
         spans.push(Span::styled(format!(" {label}"), base));
     }
     if cols.pid {
@@ -298,6 +302,43 @@ mod tests {
         let body = squeezed(&line_at(&terminal, 0));
         assert!(body.contains("Noscreensessions"));
         assert!(body.contains("Pressn"), "must point at the create key");
+    }
+
+    #[test]
+    fn status_column_is_padded_so_pid_starts_at_a_fixed_column() {
+        // 不同长度的状态文字（detached=8 / unreachable=11）pad 到同一列宽，
+        // PID 起始列不漂移、也不与状态贴死（v0.2 修订）。
+        let mut app = App::new(Caps::default());
+        let text = "There are screens on:\n\t1111111.a\t(09/23/2026 10:00:00 AM)\t(Detached)\n\
+                    \t2222222.b\t(09/23/2026 10:01:00 AM)\t(Unreachable)\n\
+                    2 Sockets in /tmp/.screen.\n";
+        app.apply_enumeration(Enumeration {
+            outlook: Outlook::Available(2),
+            list: parse::parse_list_output(text).unwrap(),
+            list_error: None,
+        });
+        let terminal = draw(&app, 120, 20);
+        let buffer = terminal.backend().buffer();
+
+        // 在缓冲区里找 PID 首个数字所在的**单元格列**（不能比拼拼接字符串：
+        // 宽字符图标占 2 格但只贡献 1 个字符，字符串下标会漂移）。
+        let pid_col = |row: u16, pid: &str| {
+            let digits: Vec<String> = pid.chars().map(String::from).collect();
+            (0..buffer.area.width - digits.len() as u16)
+                .find(|&x| {
+                    digits
+                        .iter()
+                        .enumerate()
+                        .all(|(i, d)| buffer[(x + i as u16, row)].symbol() == d.as_str())
+                })
+                .expect("pid start column")
+        };
+        let col0 = pid_col(0, "1111111");
+        let col1 = pid_col(1, "2222222");
+        assert_eq!(col0, col1, "pid column must align across status lengths");
+        // PID 前至少留两个空格（最长状态 unreachable 与 PID 不贴死）。
+        assert_eq!(buffer[(col1 - 1, 1)].symbol(), " ");
+        assert_eq!(buffer[(col1 - 2, 1)].symbol(), " ");
     }
 
     #[test]

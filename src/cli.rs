@@ -40,6 +40,13 @@ pub const EXIT_ENV: u8 = 2;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// 失败回环重启标记（内部使用，FR-03 v0.2 四修）。
+    ///
+    /// exec wrapper 检测到 screen 客户端非零退出时 `exec stui --attach-failed
+    /// <code>` 重启本进程；值是 screen 的退出码。对用户隐藏。
+    #[arg(long, hide = true)]
+    pub attach_failed: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,7 +89,11 @@ pub fn run() -> ExitCode {
         Some(Command::Version) => version_command(),
         None => {
             // TUI（M1）：需要交互终端；非 TTY 下 app::run 会自行给出明确报错。
-            ExitCode::from(crate::app::run())
+            // --attach-failed：失败回环重启，首帧弹出上一轮 attach 的失败原因。
+            let initial_error = cli.attach_failed.as_ref().map(|code| {
+                crate::i18n::fmt(crate::i18n::t().attach_exit_code, &[code])
+            });
+            ExitCode::from(crate::app::run(initial_error))
         }
     }
 }

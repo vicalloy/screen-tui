@@ -64,7 +64,8 @@ pub fn preview_with(program: &std::path::Path, full: &str) -> Result<Vec<String>
             "screen wrote no snapshot (empty or unsupported)".into(),
         ));
     }
-    let text = tmp.read_to_string()?;
+    // 有损解码（read_lossy）：hardcopy 字节流不保证 UTF-8，严格解码会把预览卡死。
+    let text = tmp.read_lossy();
     Ok(format_preview(&text, PREVIEW_COLS))
 }
 
@@ -176,6 +177,21 @@ mod tests {
 
         let err = preview_with(&script, "12345.work").unwrap_err();
         assert!(matches!(err, Error::PreviewUnavailable(_)), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 快照含非 UTF-8 字节（会话里跑过的程序留下的 latin-1 / 二进制残留）时，
+    /// 有损解码继续预览而不是报「stream did not contain valid UTF-8」。
+    #[test]
+    fn preview_tolerates_non_utf8_snapshot() {
+        let dir = std::env::temp_dir().join(format!("stui-preview-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // printf 的八进制转义写一个 latin-1 é（0xE9），不是合法 UTF-8 序列。
+        let script = fake_screen(&dir, "printf 'caf\\351 menu\\n' > \"$5\"; exit 0");
+
+        let out = preview_with(&script, "12345.work").expect("lossy preview must succeed");
+        assert_eq!(out, vec![format!("caf\u{FFFD} menu")]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

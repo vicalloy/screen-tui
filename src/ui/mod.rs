@@ -151,12 +151,6 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
                 new::render_overlay(f, draft);
             }
         }
-        Mode::AttachChoice => {
-            render_list_screen(f, app);
-            if let Some(choice) = &app.attach {
-                render_attach_choice(f, choice);
-            }
-        }
         Mode::Confirm => {
             render_list_screen(f, app);
             if let Some(confirm) = &app.confirm {
@@ -180,7 +174,42 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
                 render_meta_edit(f, edit);
             }
         }
+        Mode::Error => {
+            render_list_screen(f, app);
+            if let Some(message) = &app.error_dialog {
+                render_error_dialog(f, message);
+            }
+        }
     }
+}
+
+/// 错误提示弹层（FR-15 修订）：错误不再驻留页脚，Enter / Esc 确认后关闭。
+fn render_error_dialog(f: &mut Frame<'_>, message: &str) {
+    let t = crate::i18n::t();
+    let msg_width = crate::util::width::display_width(message);
+    // 长消息给 3/4 屏宽并让 Paragraph 折行；行数按折行后估算，保证完整可见。
+    let max_width = (f.area().width * 3 / 4).max(24) as usize;
+    let width = (msg_width + 4).clamp(28, max_width).min(f.area().width as usize);
+    let inner = width.saturating_sub(2).max(1);
+    let msg_rows = msg_width.div_ceil(inner);
+    let height = (msg_rows + 3) as u16 + 2; // 折行后消息 + 前后空行 + 提示行 + 边框
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(ratatui::style::Color::Red),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(t.error_hint.to_string(), theme::dimmed())),
+    ];
+    let area = centered_rect(f.area(), width as u16, height);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered().title(t.error_title)),
+        area,
+    );
 }
 
 /// 别名/描述输入弹层（T2.6 / FR-24）。
@@ -305,51 +334,6 @@ fn render_rename(f: &mut Frame<'_>, draft: &crate::app::RenameDraft) {
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(t.rename_title)),
-        area,
-    );
-}
-
-/// attached 冲突选择框（1.5b）：1 共享 / 2 接管 / Esc 取消。
-fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
-    let t = crate::i18n::t();
-    let mut lines = vec![
-        Line::from(Span::styled(
-            crate::i18n::fmt(t.attach_line, &[&choice.name]),
-            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                " 1 ",
-                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            Span::raw(t.attach_share.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                " 2 ",
-                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            Span::raw(t.attach_takeover.to_string()),
-        ]),
-        Line::from(""),
-    ];
-    if let Some(note) = &choice.note {
-        lines.push(Line::from(Span::styled(
-            note.clone(),
-            Style::default().fg(ratatui::style::Color::Yellow),
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        t.attach_hint.to_string(),
-        theme::dimmed(),
-    )));
-
-    let height = lines.len() as u16 + 2;
-    let area = centered_rect(f.area(), 44, height);
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(t.attach_title)),
         area,
     );
 }

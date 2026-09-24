@@ -36,8 +36,6 @@ pub enum Mode {
     Detail,
     /// `n` 新建会话三步向导（FR-02）。
     NewSession,
-    /// attached 会话的冲突选择框（共享 / 接管 / 取消，FR-03）。
-    AttachChoice,
     /// 危险操作二次确认（K / D / W，FR-13/FR-12/FR-20）。
     Confirm,
     /// `r` 重命名输入（FR-14）。
@@ -48,6 +46,8 @@ pub enum Mode {
     Preview,
     /// 别名/描述单行编辑（FR-24）。
     MetaEdit,
+    /// 错误提示弹层（FR-15 修订）：错误类消息确认后关闭，不驻留页脚。
+    Error,
 }
 
 /// 向导的字段焦点：Name / Directory / Command 三字段同屏（FR-02 验收 6）。
@@ -216,14 +216,6 @@ pub fn expand_tilde(path: &str) -> String {
         return format!("{home}/{rest}");
     }
     path.to_string()
-}
-
-/// attached 冲突选择框的挂起状态（1.5b）。
-#[derive(Debug, Clone)]
-pub struct AttachChoice {
-    pub name: String,
-    /// Multi 会话的尺寸风险提示（FR-03）。
-    pub note: Option<String>,
 }
 
 // ------------------------------------------------------------- 会话动作（T2.4）
@@ -454,14 +446,14 @@ pub struct App {
     pub selected: usize,
     /// 页脚瞬态消息（刷新失败、动作结果等），不弹窗打扰。
     pub status: Option<String>,
+    /// 错误弹层内容（FR-15 修订）：错误类消息不再驻留页脚，确认后关闭。
+    pub error_dialog: Option<String>,
     /// 新建向导草稿；仅在 `Mode::NewSession` 期间非空。
     pub draft: Option<NewDraft>,
     /// 元数据探测缓存（T2.2）：详情/过滤按 pid 取，refresh 后选中项强制重探。
     pub meta_cache: probe::MetaCache,
     /// 选中会话的元数据（cwd / command，取不到为 `None` → UI 隐藏字段，C-5）。
     pub meta: Option<probe::Meta>,
-    /// attached 冲突选择框状态；仅在 `Mode::AttachChoice` 期间非空。
-    pub attach: Option<AttachChoice>,
     /// 危险操作确认框状态；仅在 `Mode::Confirm` 期间非空。
     pub confirm: Option<ConfirmAction>,
     /// 重命名输入状态；仅在 `Mode::Rename` 期间非空。
@@ -497,6 +489,10 @@ pub struct App {
     enumerate: fn() -> crate::screen::Result<Enumeration>,
     /// 会话创建器（可测性）：生产用 [`cmd::create`]，测试注入替身 —— 单测不得真的起 screen。
     create: fn(&str, &std::path::Path, &str) -> crate::screen::Result<cmd::Run>,
+    /// hardcopy 能力探测器（可测性）：生产用 [`caps::probe_hardcopy`]，测试注入替身。
+    hardcopy_probe: fn(&str) -> crate::screen::Result<crate::screen::caps::HardcopyProbe>,
+    /// 懒探测是否已做过（只做一次，失败不重试，避免宽屏右栏逐帧重试成风暴）。
+    hardcopy_probe_attempted: bool,
     /// 待事件循环消费的**动作**请求（已过确认框）。
     action_request: Option<ConfirmAction>,
     /// 待事件循环消费的重命名请求。
@@ -554,10 +550,10 @@ impl App {
             enumeration: None,
             selected: 0,
             status: None,
+            error_dialog: None,
             draft: None,
             meta_cache: probe::MetaCache::default(),
             meta: None,
-            attach: None,
             confirm: None,
             rename: None,
             escape_prefix: None,
@@ -573,6 +569,8 @@ impl App {
             config_read_only: false,
             enumerate: parse::enumerate,
             create: cmd::create,
+            hardcopy_probe: crate::screen::caps::probe_hardcopy,
+            hardcopy_probe_attempted: false,
             action_request: None,
             rename_request: None,
             attach_request: None,
@@ -672,9 +670,26 @@ impl App {
         self.clamp_selection();
     }
 
+    /// 错误类消息走模态弹层（确认后关闭），不驻留页脚（FR-15 修订）。
+    pub(crate) fn set_error(&mut self, message: String) {
+        self.error_dialog = Some(message);
+        self.mode = Mode::Error;
+    }
+
+    /// 错误弹层的按键：Enter / Esc / q / 空格 确认关闭，其余忽略。
+    fn on_key_error(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(' ') => {
+                self.error_dialog = None;
+                self.mode = Mode::List;
+            }
+            _ => {}
+        }
+    }
+
     /// 重新枚举（screen -ls，退出码只作快路径 —— FR-19 验收 1 的 M0 修订版）。
     ///
-    /// 失败**保留旧列表**并在页脚给出原因：刷新失败不该把上一帧的真相擦掉。
+    /// 失败**保留旧列表**并给出原因：刷新失败不该把上一帧的真相擦掉。
     pub fn refresh(&mut self) {
         match (self.enumerate)() {
             Ok(enumeration) => {
@@ -682,7 +697,7 @@ impl App {
                 self.status = None;
             }
             Err(err) => {
-                self.status = Some(crate::i18n::fmt(
+                self.set_error(crate::i18n::fmt(
                     crate::i18n::t().refresh_failed,
                     &[&err.to_string()],
                 ));
@@ -780,26 +795,28 @@ impl App {
                 self.apply_enumeration(fresh);
                 match status {
                     Some(Status::Dead | Status::Unreachable) => {
-                        self.status = Some(crate::i18n::fmt(
+                        self.set_error(crate::i18n::fmt(
                             crate::i18n::t().not_connectable_share,
                             &[&name],
                         ));
                     }
                     Some(Status::Unknown(raw)) => {
-                        self.status = Some(crate::i18n::fmt(
+                        self.set_error(crate::i18n::fmt(
                             crate::i18n::t().unknown_state,
                             &[&name, &raw],
                         ));
                     }
                     Some(_) => self.request_attach(AttachKind::Share, name),
                     None => {
-                        self.status =
-                            Some(crate::i18n::fmt(crate::i18n::t().session_gone, &[&name]));
+                        self.set_error(crate::i18n::fmt(
+                            crate::i18n::t().session_gone,
+                            &[&name],
+                        ));
                     }
                 }
             }
             Err(err) => {
-                self.status = Some(crate::i18n::fmt(
+                self.set_error(crate::i18n::fmt(
                     crate::i18n::t().verify_failed,
                     &[&err.to_string()],
                 ));
@@ -856,11 +873,11 @@ impl App {
             Mode::Help | Mode::Preview => self.on_key_overlay(key.code),
             Mode::Detail => self.on_key_detail(key.code),
             Mode::NewSession => self.on_key_new(key.code),
-            Mode::AttachChoice => self.on_key_attach_choice(key.code),
             Mode::Confirm => self.on_key_confirm(key.code),
             Mode::Rename => self.on_key_rename(key.code),
             Mode::Filter => self.on_key_filter(key.code),
             Mode::MetaEdit => self.on_key_meta_edit(key.code),
+            Mode::Error => self.on_key_error(key.code),
         }
     }
 
@@ -922,7 +939,7 @@ impl App {
         match (self.enumerate)() {
             Ok(fresh) => self.plan_connect(fresh),
             Err(err) => {
-                self.status = Some(crate::i18n::fmt(
+                self.set_error(crate::i18n::fmt(
                     crate::i18n::t().verify_failed,
                     &[&err.to_string()],
                 ));
@@ -931,6 +948,10 @@ impl App {
     }
 
     /// 连接决策（纯逻辑，吃注入的新鲜枚举结果）。
+    ///
+    /// v0.2 修订：`Enter` 一律接管 —— detached 用 `-r` 直连，attached/multi 用
+    /// `-d -r`（先摘别的显示器再进，绝不用 `-D`）；共享改由 `x` 键承担
+    /// （[`App::start_share`]），不再弹 1/2 选择框。
     pub fn plan_connect(&mut self, fresh: Enumeration) {
         let Some(name) = self.sessions().get(self.selected).map(|s| s.name.clone()) else {
             return;
@@ -946,67 +967,36 @@ impl App {
         match fresh_status {
             None => {
                 // 会话已消失：明确提示 + 刷新，不卡死（FR-03 验收 3）。
-                self.status = Some(crate::i18n::fmt(crate::i18n::t().session_gone, &[&name]));
+                self.set_error(crate::i18n::fmt(crate::i18n::t().session_gone, &[&name]));
                 self.apply_enumeration(fresh);
             }
             Some(status) => {
                 self.apply_enumeration(fresh);
                 match status {
                     Status::Detached => self.request_attach(AttachKind::Resume, name),
-                    Status::Attached => {
-                        self.attach = Some(AttachChoice { name, note: None });
-                        self.mode = Mode::AttachChoice;
-                    }
-                    Status::Multi => {
-                        self.attach = Some(AttachChoice {
-                            name,
-                            note: Some(crate::i18n::t().multi_note.into()),
-                        });
-                        self.mode = Mode::AttachChoice;
+                    Status::Attached | Status::Multi => {
+                        self.request_attach(AttachKind::Takeover, name)
                     }
                     // dead / unreachable 拒连（FR-03 表）。
                     Status::Dead => {
-                        self.status =
-                            Some(crate::i18n::fmt(crate::i18n::t().dead_wipe_hint, &[&name]));
+                        self.set_error(crate::i18n::fmt(
+                            crate::i18n::t().dead_wipe_hint,
+                            &[&name],
+                        ));
                     }
                     Status::Unreachable => {
-                        self.status = Some(crate::i18n::fmt(
+                        self.set_error(crate::i18n::fmt(
                             crate::i18n::t().unreachable_hint,
                             &[&name],
                         ));
                     }
                     Status::Unknown(raw) => {
-                        self.status = Some(crate::i18n::fmt(
+                        self.set_error(crate::i18n::fmt(
                             crate::i18n::t().unknown_state,
                             &[&name, &raw],
                         ));
                     }
                 }
-            }
-        }
-    }
-
-    fn on_key_attach_choice(&mut self, code: KeyCode) {
-        let Some(choice) = self.attach.take() else {
-            self.mode = Mode::List;
-            return;
-        };
-        match code {
-            // 1 共享 / 2 接管（-d -r，绝不用 -D -r）/ Esc 取消（1.5b）。
-            KeyCode::Char('1') => {
-                self.mode = Mode::List;
-                self.request_attach(AttachKind::Share, choice.name);
-            }
-            KeyCode::Char('2') => {
-                self.mode = Mode::List;
-                self.request_attach(AttachKind::Takeover, choice.name);
-            }
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.mode = Mode::List;
-            }
-            _ => {
-                // 其它按键不消费选择框状态。
-                self.attach = Some(choice);
             }
         }
     }
@@ -1023,11 +1013,12 @@ impl App {
         self.attach_request.take()
     }
 
-    /// 连接结果落账（FR-03 验收 2：无论子进程退出码如何，都回到列表，不退出 TUI）。
-    pub fn note_attach_outcome(&mut self, request: &AttachRequest, run: &crate::screen::cmd::Run) {
-        self.mode = Mode::List;
-        // 先刷新再落账：refresh() 成功时会清掉瞬态消息，结果消息必须留在最后。
-        self.refresh();
+    /// 连接前的落账（FR-03 v0.2：exec 替换进程，**没有「返回后落账」的时机**）。
+    ///
+    /// 在 exec 前完成：观察记录（FR-24）+ 收藏目录（T2.7 / FR-23）+ 存盘。
+    /// 代价是 exec 失败（极罕见）时记录也已写入 —— 连接意向本身是有价值信号，
+    /// 采用乐观记录。唯一的 UI 状态要求：不改变 mode（事件循环还要继续）。
+    pub fn note_attach_intent(&mut self, request: &AttachRequest) {
         // 连接过的会话留观察记录（FR-24）：managed 条目只更新 last_seen。
         let name = request
             .target
@@ -1035,33 +1026,41 @@ impl App {
             .map(|(_, n)| n.to_string())
             .unwrap_or_else(|| request.target.clone());
         self.record_seen(&name);
-        // 收藏目录（T2.7 / FR-23）：连接成功且缓存里已有 cwd 时记录（只读窥视，
+        // 收藏目录（T2.7 / FR-23）：缓存里已有 cwd 时记录（只读窥视，
         // 不为记录目录再跑一轮探测 —— 取不到就不记，C-5）。
-        let mut cwd_to_record = None;
-        if run.success()
-            && let Some(session) = self.all_sessions().iter().find(|s| s.name == name)
+        if let Some(session) = self.all_sessions().iter().find(|s| s.name == name)
             && let Some(pid) = session.pid
             && let Ok(pid) = u32::try_from(pid)
             && let Some(meta) = self.meta_cache.peek(pid)
             && let Some(cwd) = &meta.cwd
         {
-            cwd_to_record = Some(cwd.clone());
-        }
-        if let Some(cwd) = cwd_to_record {
-            self.config.touch_dir(&cwd);
+            self.config.touch_dir(cwd);
         }
         self.save_config();
-        self.status = Some(if run.success() {
-            crate::i18n::fmt(crate::i18n::t().detached_from, &[&request.target])
-        } else {
-            crate::i18n::fmt(
-                crate::i18n::t().screen_exit_code,
-                &[&run.code.to_string(), request.kind.label()],
-            )
-        });
     }
 
     // ------------------------------------------------------------- 预览（T2.3 / FR-15）
+
+    /// hardcopy 能力懒探测（FR-15 修订）。
+    ///
+    /// TUI 启动时不探测（[`Caps::detect`] 传 `None`：探测需要一个真实会话，
+    /// 且文档化的副作用检查点是 doctor）—— 因此 `caps.hardcopy` 初始恒为
+    /// `Unknown`，若只拿它当预览门槛，预览会被永久卡死在「support is unknown」
+    /// 而 doctor 却显示 PASS。改为：首次尝试预览时对选中会话实测一次并回填
+    /// `caps.hardcopy`，与 doctor 结论对齐。只试一次，失败不重试。
+    fn ensure_hardcopy_probed(&mut self, full: &str) {
+        if self.hardcopy_probe_attempted {
+            return;
+        }
+        self.hardcopy_probe_attempted = true;
+        match (self.hardcopy_probe)(full) {
+            Ok(probe) => self.caps.apply_hardcopy_probe(&probe),
+            Err(err) => self
+                .caps
+                .probe_notes
+                .push(format!("hardcopy probe failed: {err}")),
+        }
+    }
 
     /// `p` 预览入口：能力/状态门槛在这里拦（给可读原因），抓取请求交事件循环。
     fn open_preview(&mut self) {
@@ -1070,14 +1069,17 @@ impl App {
             return;
         };
         if matches!(session.status, Status::Dead | Status::Unreachable) {
-            self.status = Some(crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().preview_not_running,
                 &[&session.name],
             ));
             return;
         }
+        if self.caps.hardcopy == crate::screen::caps::Support::Unknown {
+            self.ensure_hardcopy_probed(&session.full);
+        }
         if !self.caps.hardcopy.usable() {
-            self.status = Some(crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().preview_unavailable,
                 &[self.caps.hardcopy.label()],
             ));
@@ -1094,7 +1096,7 @@ impl App {
     /// 宽屏右栏（FR-15 验收 5）：预览常驻并随选中项更新 —— 选中项变化时产一次抓取请求。
     /// 失败由事件循环静默降级（pane 显示提示，不用 status 刷屏）。
     pub fn wide_preview_due(&mut self, is_wide: bool) -> Option<PreviewRequest> {
-        if !is_wide || self.mode != Mode::List || !self.caps.hardcopy.usable() {
+        if !is_wide || self.mode != Mode::List {
             return None;
         }
         if self.preview_request.is_some() {
@@ -1102,6 +1104,12 @@ impl App {
         }
         let visible = self.sessions();
         let session = visible.get(self.selected)?;
+        if self.caps.hardcopy == crate::screen::caps::Support::Unknown {
+            self.ensure_hardcopy_probed(&session.full);
+        }
+        if !self.caps.hardcopy.usable() {
+            return None;
+        }
         let full = session.full.clone();
         if self.last_preview_target.as_deref() == Some(full.as_str()) {
             return None;
@@ -1148,7 +1156,7 @@ impl App {
             self.last_preview_target = None;
         }
         if request.manual {
-            self.status = Some(reason);
+            self.set_error(reason);
         }
     }
 
@@ -1193,28 +1201,28 @@ impl App {
             return;
         };
         if session.status != Status::Dead {
-            self.status = Some(crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().restart_still_running,
                 &[&session.name],
             ));
             return;
         }
         let Some(meta) = self.config.sessions.get(&session.name).cloned() else {
-            self.status = Some(crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().restart_not_managed,
                 &[&session.name],
             ));
             return;
         };
         if !meta.managed {
-            self.status = Some(crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().restart_unmanaged,
                 &[&session.name],
             ));
             return;
         }
         let (Some(command), Some(cwd)) = (meta.command.clone(), meta.cwd.clone()) else {
-            self.status = Some(crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().restart_no_record,
                 &[&session.name],
             ));
@@ -1243,7 +1251,7 @@ impl App {
                 &[&request.name],
             ));
         } else {
-            self.status = Some(crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().restart_failed,
                 &[&request.name, &run.code.to_string(), run.text().trim()],
             ));
@@ -1292,11 +1300,17 @@ impl App {
             self.config.sessions.remove(name);
         }
         let saved = self.save_config();
-        self.status = Some(if saved {
-            crate::i18n::fmt(crate::i18n::t().removed_stale, &[&count.to_string()])
+        if saved {
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().removed_stale,
+                &[&count.to_string()],
+            ));
         } else {
-            crate::i18n::fmt(crate::i18n::t().removed_stale_ro, &[&count.to_string()])
-        });
+            self.set_error(crate::i18n::fmt(
+                crate::i18n::t().removed_stale_ro,
+                &[&count.to_string()],
+            ));
+        }
     }
 
     /// 打开元数据字段编辑（详情弹层 `a` / `t`）。
@@ -1355,11 +1369,17 @@ impl App {
                 let saved = self.save_config();
                 self.meta_edit = None;
                 self.mode = Mode::List;
-                self.status = Some(if saved {
-                    crate::i18n::fmt(crate::i18n::t().meta_updated, &[&session, &field_label])
+                if saved {
+                    self.status = Some(crate::i18n::fmt(
+                        crate::i18n::t().meta_updated,
+                        &[&session, &field_label],
+                    ));
                 } else {
-                    crate::i18n::fmt(crate::i18n::t().meta_kept_ro, &[&session, &field_label])
-                });
+                    self.set_error(crate::i18n::fmt(
+                        crate::i18n::t().meta_kept_ro,
+                        &[&session, &field_label],
+                    ));
+                }
             }
             _ => self.meta_edit = Some(edit),
         }
@@ -1375,7 +1395,7 @@ impl App {
             ActionKind::Cleanup => return,
             ActionKind::Wipe => {
                 if !self.sessions().iter().any(|s| s.status == Status::Dead) {
-                    self.status = Some(crate::i18n::t().no_dead_to_wipe.into());
+                    self.set_error(crate::i18n::t().no_dead_to_wipe.into());
                     return;
                 }
                 self.confirm = Some(ConfirmAction {
@@ -1394,8 +1414,19 @@ impl App {
                 if kind == ActionKind::Detach
                     && !matches!(session.status, Status::Attached | Status::Multi)
                 {
-                    self.status = Some(crate::i18n::fmt(
+                    self.set_error(crate::i18n::fmt(
                         crate::i18n::t().not_attached,
+                        &[&session.name],
+                    ));
+                    return;
+                }
+                // attached/multi 的会话不允许 kill：会话正被别的终端使用，
+                // 直接 quit 会把对端连人带会话一起砍掉 —— 先断开再杀（v0.2 修订）。
+                if kind == ActionKind::Kill
+                    && matches!(session.status, Status::Attached | Status::Multi)
+                {
+                    self.set_error(crate::i18n::fmt(
+                        crate::i18n::t().kill_attached,
                         &[&session.name],
                     ));
                     return;
@@ -1486,6 +1517,12 @@ impl App {
                 }
             }
             ActionKind::Kill => match found {
+                // attached/multi 拒绝 kill（新鲜状态复核，v0.2 修订）：会话正被
+                // 别的终端使用，-X quit 会连人带会话一起砍掉 —— 先断开再杀。
+                Some(Status::Attached | Status::Multi) => Err(crate::i18n::fmt(
+                    crate::i18n::t().kill_attached,
+                    &[&action.display],
+                )),
                 Some(_) => Ok(()),
                 None => Err(crate::i18n::fmt(
                     crate::i18n::t().gone_kill,
@@ -1512,18 +1549,18 @@ impl App {
     /// 动作结果落账：先刷新再给结论（refresh 会清瞬态消息，顺序不能反）。
     pub fn note_action_outcome(&mut self, action: &ConfirmAction, run: &cmd::Run) {
         self.refresh();
-        self.status = Some(if run.success() {
-            match action.kind {
+        if run.success() {
+            self.status = Some(match action.kind {
                 ActionKind::Wipe => crate::i18n::t().wiped.to_string(),
                 _ => crate::i18n::fmt(
                     crate::i18n::t().action_done,
                     &[&action.display, action.kind.label()],
                 ),
-            }
+            });
         } else {
             let detail = run.text();
             let detail = detail.trim();
-            crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().action_failed,
                 &[
                     action.kind.label(),
@@ -1535,8 +1572,8 @@ impl App {
                         format!(": {detail}")
                     },
                 ],
-            )
-        });
+            ));
+        }
     }
 
     // ------------------------------------------------------------- 重命名（T2.4 / FR-14）
@@ -1600,14 +1637,17 @@ impl App {
     /// 重命名结果落账（FR-14 验收：列表立即按新名显示）。
     pub fn note_rename_outcome(&mut self, request: &RenameRequest, run: &cmd::Run) {
         self.refresh();
-        self.status = Some(if run.success() {
-            crate::i18n::fmt(crate::i18n::t().renamed_to, &[&request.new_name])
+        if run.success() {
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().renamed_to,
+                &[&request.new_name],
+            ));
         } else {
-            crate::i18n::fmt(
+            self.set_error(crate::i18n::fmt(
                 crate::i18n::t().rename_failed,
                 &[&run.code.to_string(), run.text().trim()],
-            )
-        });
+            ));
+        }
     }
 
     fn on_key_overlay(&mut self, code: KeyCode) {
@@ -1998,7 +2038,10 @@ fn current_field_mut(draft: &mut NewDraft) -> &mut String {
 }
 
 /// TUI 入口：环境检查 → 探测 → 守护终端 → 事件循环。返回进程退出码。
-pub fn run() -> u8 {
+///
+/// `initial_error`：失败回环重启（`--attach-failed <code>`）时携带的错误消息，
+/// 进入事件循环前以错误弹层呈现 —— 用户看到的第一帧就是失败原因。
+pub fn run(initial_error: Option<String>) -> u8 {
     use std::io::IsTerminal;
 
     // TUI 需要 stdin/stdout 都是 TTY；非交互场景明确指路 `stui ls`（NFR-09）。
@@ -2054,6 +2097,11 @@ pub fn run() -> u8 {
     if !loaded.warnings.is_empty() {
         app.status = Some(loaded.warnings.join("; "));
     }
+    // 失败回环重启（FR-03 v0.2 四修）：上一轮 attach 的 screen 非零退出，
+    // wrapper 重启了本进程 —— 首帧即弹错误框，绝不静默吞掉连接失败。
+    if let Some(message) = initial_error {
+        app.set_error(message);
+    }
 
     let outcome = event_loop(&mut terminal, &mut guard, &mut app);
 
@@ -2106,21 +2154,23 @@ fn event_loop(
             || matches!(tier, ui::layout::Tier::Wide | ui::layout::Tier::Mid);
         app.ensure_window_count(detail_visible);
 
-        // 连接请求：suspend → 前台 screen → resume → 强制重绘（1.5d）。
+        // 连接请求（FR-03 v0.2 四修）：exec 替换进程进入 screen —— 绝不 spawn。
+        // 成功路径上本进程已消失（detach 后回 shell）；screen 非零退出由
+        // wrapper 回环重启 stui（--attach-failed），同样不回到本循环。
+        // 走到后续恢复+报错的只有 exec 本身失败这一种情况。
         if let Some(request) = app.take_attach_request() {
+            app.note_attach_intent(&request);
             let hint = detach_hint_text(app.escape_prefix.as_deref());
-            match attach_foreground(terminal, guard, &request, &hint) {
-                Ok(run) => app.note_attach_outcome(&request, &run),
-                Err(err) => {
-                    app.mode = Mode::List;
-                    app.status = Some(crate::i18n::fmt(
-                        crate::i18n::t().attach_failed,
-                        &[&err.to_string()],
-                    ));
-                }
-            }
-            // 子进程画过屏幕：清掉 ratatui 的 diff 基线，强制整屏重绘。
-            terminal.clear()?;
+            let err = attach_exec(terminal, guard, &request, &hint);
+            // exec 失败：终端已被 attach_exec suspend，恢复 TUI 并弹错误框，
+            // 绝不因连接失败退出 TUI。
+            let _ = guard.resume();
+            app.set_error(crate::i18n::fmt(
+                crate::i18n::t().attach_failed,
+                &[&err.to_string()],
+            ));
+            // exec 前还原过终端：清掉 ratatui 的 diff 基线，强制整屏重绘。
+            let _ = terminal.clear();
         }
 
         // 危险动作（T2.4）：确认框通过后，**执行前**拿新鲜枚举重校验（NFR-08）。
@@ -2138,7 +2188,7 @@ fn event_loop(
                         Ok(run) => app.note_action_outcome(&action, &run),
                         Err(err) => {
                             app.refresh();
-                            app.status = Some(crate::i18n::fmt(
+                            app.set_error(crate::i18n::fmt(
                                 crate::i18n::t().action_failed_short,
                                 &[action.kind.label(), &err.to_string()],
                             ));
@@ -2149,7 +2199,7 @@ fn event_loop(
                 },
                 Err(message) => {
                     app.refresh();
-                    app.status = Some(message);
+                    app.set_error(message);
                 }
             }
         }
@@ -2160,7 +2210,7 @@ fn event_loop(
                 Ok(run) => app.note_rename_outcome(&request, &run),
                 Err(err) => {
                     app.refresh();
-                    app.status = Some(crate::i18n::fmt(
+                    app.set_error(crate::i18n::fmt(
                         crate::i18n::t().rename_failed_short,
                         &[&err.to_string()],
                     ));
@@ -2179,7 +2229,7 @@ fn event_loop(
                 Ok(run) => app.note_restart_outcome(&request, &run),
                 Err(err) => {
                     app.refresh();
-                    app.status = Some(crate::i18n::fmt(
+                    app.set_error(crate::i18n::fmt(
                         crate::i18n::t().restart_failed_short,
                         &[&err.to_string()],
                     ));
@@ -2210,30 +2260,36 @@ fn execute_preview(app: &mut App, request: &PreviewRequest) {
     }
 }
 
-/// 前台执行连接（1.5d）：spawn 而非 exec —— exec 会替换进程，detach 后无法回到 TUI。
-fn attach_foreground(
+/// 前台连接（FR-03 v0.2 四修）：exec 替换进程。
+///
+/// 成功时本函数**不返回** —— 进程映像被 sh+screen 替换，detach / 退出 screen
+/// 后回到启动 stui 的 shell；screen 非零退出由 wrapper 回环重启 stui
+/// （`--attach-failed`），错误以弹层呈现。只在 suspend 或 exec 失败时返回
+/// `io::Error`，调用方负责恢复 TUI 并报错。
+fn attach_exec(
     terminal: &mut ui::TuiTerminal,
     guard: &mut ui::TuiGuard,
     request: &AttachRequest,
     hint: &str,
-) -> crate::screen::Result<crate::screen::cmd::Run> {
+) -> std::io::Error {
     use std::io::Write;
 
-    // 离开备用屏前把缓冲刷掉，然后还原终端给 screen。
-    terminal.flush()?;
-    guard.suspend()?;
+    // 离开备用屏前把缓冲刷掉，然后完整还原终端给 screen。
+    // exec 不会自动改 termios：不 suspend，screen 会继承 raw mode 初始化失败。
+    if let Err(err) = terminal.flush() {
+        return err;
+    }
+    if let Err(err) = guard.suspend() {
+        return err;
+    }
 
-    // 1.5c：detach 提示打印到真实终端（留在滚动缓冲里，不进 TUI 画面）。
-    // FR-18：前缀按探测/配置结果给出。
+    // detach 提示打印到真实终端：exec 后留在 shell 滚动缓冲里，
+    // `Ctrl-a d` 断开回到 shell 时抬头可见（FR-18：前缀按探测/配置给出）。
     let mut stdout = std::io::stdout();
     let _ = writeln!(stdout, "{hint}");
     let _ = stdout.flush();
 
-    let run = cmd::attach(request.kind, &request.target);
-
-    // 子进程退出（无论退出码是什么）→ 恢复 TUI（FR-03 验收 2 头号契约）。
-    guard.resume()?;
-    run
+    cmd::exec_attach(request.kind, &request.target)
 }
 
 #[cfg(test)]
@@ -2255,8 +2311,9 @@ mod tests {
     fn app_with(text: &str) -> App {
         let mut app = App::new(Caps::default());
         app.apply_enumeration(enumeration(text));
-        // 默认就装上创建替身：单测里任何一条路径都不许真的起 screen。
+        // 默认就装上创建/探测替身：单测里任何一条路径都不许真的起 screen。
         app.create = fake_create;
+        app.hardcopy_probe = fake_hardcopy_probe_unknown;
         app
     }
 
@@ -2480,6 +2537,17 @@ mod tests {
             code: 0,
             stdout: String::new(),
             stderr: String::new(),
+        })
+    }
+
+    /// hardcopy 探测替身：回报「能力未证实」，不碰真实 screen。
+    fn fake_hardcopy_probe_unknown(
+        _full: &str,
+    ) -> crate::screen::Result<crate::screen::caps::HardcopyProbe> {
+        Ok(crate::screen::caps::HardcopyProbe {
+            hardcopy: crate::screen::caps::Support::Unknown,
+            history: crate::screen::caps::Support::Unknown,
+            detail: "stub: capability left unknown".into(),
         })
     }
 
@@ -2894,13 +2962,14 @@ mod tests {
         app.plan_connect(fresh);
 
         assert!(app.take_attach_request().is_none(), "must not attach");
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("'dep' is gone"),
             "{}",
-            app.status.as_deref().unwrap_or_default()
+            app.error_dialog.as_deref().unwrap_or_default()
         );
         // 列表已被刷新（只剩 1 条）。
         assert_eq!(app.sessions().len(), 1);
@@ -2920,59 +2989,29 @@ mod tests {
     }
 
     #[test]
-    fn attached_session_opens_the_conflict_choice() {
+    fn attached_session_takeover_directly() {
         let mut app = app_with(FOUR);
         app.selected = 2; // llm (Attached)
         app.plan_connect(enumeration(FOUR));
 
-        assert_eq!(app.mode, Mode::AttachChoice);
-        assert!(
-            app.take_attach_request().is_none(),
-            "waiting for user choice"
-        );
-        assert_eq!(app.attach.as_ref().unwrap().name, "llm");
-
-        // 2 → 接管（-d -r）。
-        app.on_key(key(KeyCode::Char('2')));
-        let request = app.take_attach_request().unwrap();
+        // v0.2：Enter 一律接管（-d -r），不再弹 1/2 选择框。
+        let request = app
+            .take_attach_request()
+            .expect("takeover request produced");
         assert_eq!(request.kind, AttachKind::Takeover);
         assert_eq!(app.mode, Mode::List);
-    }
-
-    #[test]
-    fn conflict_choice_sharing_and_cancelling() {
-        let mut app = app_with(FOUR);
-        app.selected = 2; // llm (Attached)
-        app.plan_connect(enumeration(FOUR));
-
-        // 1 → 共享。
-        app.on_key(key(KeyCode::Char('1')));
-        let request = app.take_attach_request().unwrap();
-        assert_eq!(request.kind, AttachKind::Share);
-
-        // Esc → 取消，无请求。
-        app.selected = 1;
-        app.plan_connect(enumeration(FOUR));
-        app.on_key(key(KeyCode::Esc));
         assert!(app.take_attach_request().is_none());
-        assert_eq!(app.mode, Mode::List);
     }
 
     #[test]
-    fn multi_session_choice_carries_a_size_warning() {
+    fn multi_session_takeover_directly() {
         let text = "There are screens on:\n\t12345.share\t(09/23/2026 10:00:00 AM)\t(Multi)\n1 Socket in /tmp/.screen.\n";
         let mut app = app_with(text);
         app.plan_connect(enumeration(text));
 
-        assert_eq!(app.mode, Mode::AttachChoice);
-        let note = app
-            .attach
-            .as_ref()
-            .unwrap()
-            .note
-            .as_deref()
-            .expect("size note");
-        assert!(note.contains("resize"), "{note}");
+        let request = app.take_attach_request().expect("takeover request");
+        assert_eq!(request.kind, AttachKind::Takeover);
+        assert_eq!(request.target, "share");
     }
 
     #[test]
@@ -2981,15 +3020,26 @@ mod tests {
         app.selected = 1; // legacy (Dead)
         app.plan_connect(enumeration(FOUR));
         assert!(app.take_attach_request().is_none(), "dead must be refused");
-        assert!(app.status.as_deref().unwrap_or_default().contains("dead"));
+        // 拒绝走错误弹层，不再是页脚（FR-15 修订）。
+        assert_eq!(app.mode, Mode::Error);
+        assert!(
+            app.error_dialog
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dead")
+        );
+        // Enter 确认后回列表。
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::List);
 
         // 未知状态同样拒连（C-5：不猜）。
         let text = "There is a screen on:\n\t12345.weird\t(09/23/2026 10:00:00 AM)\t(???)\n1 Socket in /tmp/.screen.\n";
         let mut app = app_with(text);
         app.plan_connect(enumeration(text));
         assert!(app.take_attach_request().is_none());
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("unknown state")
@@ -3007,42 +3057,25 @@ mod tests {
     }
 
     #[test]
-    fn attach_outcome_always_returns_to_the_list() {
+    fn attach_intent_records_seen_and_keeps_mode() {
         let mut app = app_with(FOUR);
-        app.mode = Mode::AttachChoice;
 
         let request = AttachRequest {
             kind: AttachKind::Resume,
-            target: "work".into(),
+            target: "12345.work".into(),
         };
 
-        // 成功。
-        let ok_run = crate::screen::cmd::Run {
-            command: "screen -U -r work".into(),
-            code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        };
-        app.note_attach_outcome(&request, &ok_run);
+        // exec 前落账：不改 mode、不退出、不弹错误（成功路径不会有任何 UI 痕迹 ——
+        // 进程随即被 screen 替换）。
+        app.note_attach_intent(&request);
         assert_eq!(app.mode, Mode::List);
         assert!(!app.should_quit);
+        assert!(app.error_dialog.is_none());
+        // FR-24：观察记录已写入（config.sessions["work"].last_seen 被置位）。
         assert!(
-            app.status
-                .as_deref()
-                .unwrap_or_default()
-                .contains("detached")
+            app.config.sessions["work"].last_seen.is_some(),
+            "attach must record last_seen"
         );
-
-        // 非零退出码：回列表并如实报告，绝不吞掉（1.5d 替身契约）。
-        let fail_run = crate::screen::cmd::Run {
-            command: "screen -U -r work".into(),
-            code: 7,
-            stdout: String::new(),
-            stderr: String::new(),
-        };
-        app.note_attach_outcome(&request, &fail_run);
-        assert_eq!(app.mode, Mode::List);
-        assert!(app.status.as_deref().unwrap_or_default().contains("7"));
     }
 
     #[test]
@@ -3140,15 +3173,49 @@ mod tests {
         app.on_key(key(KeyCode::Char('D')));
         assert_eq!(
             app.mode,
-            Mode::List,
-            "detached target must not open confirm"
+            Mode::Error,
+            "detached target must be refused via dialog"
         );
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("not attached")
         );
+    }
+
+    #[test]
+    fn kill_entry_is_refused_for_attached_sessions() {
+        let mut app = app_with(FOUR);
+        app.selected = 2; // llm（Attached）
+        app.on_key(key(KeyCode::Char('K')));
+        // v0.2 修订：attached 会话不允许 kill —— 错误弹层，不出确认框。
+        assert_eq!(app.mode, Mode::Error);
+        assert!(app.take_action().is_none());
+        let message = app
+            .error_dialog
+            .as_deref()
+            .unwrap_or_default();
+        assert!(message.contains("kill refused"), "{message}");
+
+        // 确认弹层后回到列表，界面仍可用。
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::List);
+    }
+
+    #[test]
+    fn validate_action_refuses_kill_of_attached_session_with_fresh_state() {
+        let mut app = app_with(FOUR);
+        // 键位时刻目标还是 detached（确认框放行），执行前新鲜 -ls 显示已被
+        // 别的终端接管 → 必须拒绝，防止把对端连人带会话一起砍掉。
+        let action = confirm_action(ActionKind::Kill, "12345.work");
+        let fresh = enumeration(
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Attached)\n1 Socket in /tmp/.screen.\n",
+        );
+        let err = app
+            .validate_action(fresh, &action)
+            .expect_err("attached kill must be refused");
+        assert!(err.contains("kill refused"), "{err}");
     }
 
     #[test]
@@ -3164,10 +3231,10 @@ mod tests {
             "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
         );
         clean.on_key(key(KeyCode::Char('W')));
-        assert_eq!(clean.mode, Mode::List);
+        assert_eq!(clean.mode, Mode::Error);
         assert!(
             clean
-                .status
+                .error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("nothing to wipe")
@@ -3267,8 +3334,9 @@ mod tests {
             stderr: "no such session".into(),
         };
         app.note_rename_outcome(&request, &fail_run);
+        assert!(app.mode == Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("rename failed")
@@ -3300,9 +3368,10 @@ mod tests {
             stderr: "no such session".into(),
         };
         app.note_action_outcome(&action, &fail_run);
-        let status = app.status.as_deref().unwrap_or_default();
-        assert!(status.contains("kill"), "{status}");
-        assert!(status.contains("exit 1"), "{status}");
+        assert_eq!(app.mode, Mode::Error);
+        let dialog = app.error_dialog.as_deref().unwrap_or_default();
+        assert!(dialog.contains("kill"), "{dialog}");
+        assert!(dialog.contains("exit 1"), "{dialog}");
     }
 
     // ------------------------------------------------------------- T2.5 过滤 / 数字直连 / 详情增强
@@ -3317,12 +3386,12 @@ mod tests {
         let mut app = app_with(FOUR); // 排序后：dep / legacy / llm / work
         app.enumerate = fake_enumerate;
 
-        app.on_key(key(KeyCode::Char('2'))); // 第 2 行 = legacy（dead）→ 拒连
+        app.on_key(key(KeyCode::Char('2'))); // 第 2 行 = legacy（dead）→ 拒连（错误弹层）
         assert!(app.take_attach_request().is_none());
+        app.on_key(key(KeyCode::Enter)); // 确认关闭弹层
+        assert_eq!(app.mode, Mode::List);
 
-        app.on_key(key(KeyCode::Char('3'))); // 第 3 行 = llm（attached）→ 选择框
-        assert_eq!(app.mode, Mode::AttachChoice);
-        app.on_key(key(KeyCode::Char('2'))); // 接管
+        app.on_key(key(KeyCode::Char('3'))); // 第 3 行 = llm（attached）→ 直接接管
         let request = app.take_attach_request().unwrap();
         assert_eq!(request.target, "llm");
 
@@ -3347,8 +3416,9 @@ mod tests {
         app.selected = 1; // legacy（dead）
         app.on_key(key(KeyCode::Char('x')));
         assert!(app.take_attach_request().is_none());
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("not connectable")
@@ -3462,37 +3532,42 @@ mod tests {
 
     #[test]
     fn preview_open_guards_capabilities_and_dead() {
-        // hardcopy 能力未证实（Unknown）→ 拒绝并说明（FR-15 验收 3 的降级路径）。
+        // hardcopy 能力未证实（Unknown）：懒探测一次后仍 Unknown → 错误弹层，不发请求。
         let mut app = app_with(FOUR);
         app.selected = 0;
         app.on_key(key(KeyCode::Char('p')));
         assert!(app.take_preview_request().is_none());
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("preview unavailable")
         );
 
-        // dead 会话拒绝预览（2.3d）。
+        // 弹层 Enter 关闭；探测回填 Yes 后再按 p 正常产出请求（门槛只拦 No/Unknown）。
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.error_dialog.is_none());
+        app.caps.hardcopy = crate::screen::caps::Support::Yes;
+        app.on_key(key(KeyCode::Char('p')));
+        let request = app.take_preview_request().expect("preview request");
+        assert!(request.manual);
+        assert_eq!(request.full, "12347.dep");
+
+        // dead 会话拒绝预览（2.3d）：错误弹层。
         let mut app = app_with(FOUR);
         app.caps.hardcopy = crate::screen::caps::Support::Yes;
         app.selected = 1; // legacy（dead）
         app.on_key(key(KeyCode::Char('p')));
         assert!(app.take_preview_request().is_none());
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("nothing to preview")
         );
-
-        // detached + 能力可用 → 产出手动抓取请求。
-        app.selected = 0; // dep
-        app.on_key(key(KeyCode::Char('p')));
-        let request = app.take_preview_request().expect("preview request");
-        assert!(request.manual);
-        assert_eq!(request.full, "12347.dep");
     }
 
     #[test]
@@ -3511,10 +3586,16 @@ mod tests {
         assert!(!view.fetched.is_empty());
         assert_eq!(app.mode, Mode::Preview);
 
-        // 失败（手动）：status 给原因，视图被清，不留陈旧内容。
+        // 失败（手动）：错误弹层给原因，视图被清，不留陈旧内容。
         app.note_preview_failed(&request, "preview unavailable: boom".into());
         assert!(app.preview.is_none());
-        assert!(app.status.as_deref().unwrap_or_default().contains("boom"));
+        assert_eq!(app.mode, Mode::Error);
+        assert!(
+            app.error_dialog
+                .as_deref()
+                .unwrap_or_default()
+                .contains("boom")
+        );
     }
 
     #[test]
@@ -3587,38 +3668,44 @@ mod tests {
     fn restart_is_restricted_to_dead_managed_sessions() {
         let (mut app, dir) = app_with_config_dir("restart");
 
-        // detached 会话：无需重启。
+        // detached 会话：无需重启（弹层拒绝）。
         app.selected = 0; // dep（detached）
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.take_restart_request().is_none());
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("still running")
         );
+        app.on_key(key(KeyCode::Enter)); // 关闭弹层
 
         // dead 但没有元数据 → 明确拒绝。
         app.selected = 1; // legacy（dead）
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.take_restart_request().is_none());
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("not created by stui")
         );
+        app.on_key(key(KeyCode::Enter));
 
         // dead + unmanaged 记录 → 拒绝（FR-24 验收 1）。
         app.record_seen("legacy");
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.take_restart_request().is_none());
+        assert_eq!(app.mode, Mode::Error);
         assert!(
-            app.status
+            app.error_dialog
                 .as_deref()
                 .unwrap_or_default()
                 .contains("unmanaged")
         );
+        app.on_key(key(KeyCode::Enter));
 
         // dead + managed 记录 → 产出重启请求（记录的 command+cwd）。
         app.record_managed("legacy", "/srv/legacy", "bash -l");
@@ -3767,13 +3854,8 @@ mod tests {
             },
         );
 
-        let ok_run = cmd::Run {
-            command: "screen -U -r 12347.dep".into(),
-            code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-        };
-        app.note_attach_outcome(&request, &ok_run);
+        // exec 前落账：缓存里的 cwd 进入收藏目录。
+        app.note_attach_intent(&request);
         let paths: Vec<&str> = app.config.dirs.iter().map(|d| d.path.as_str()).collect();
         assert!(paths.contains(&"/srv/dep"), "{paths:?}");
 
@@ -3804,8 +3886,8 @@ mod tests {
         );
     }
 
-    /// M1 出口自查：40 列目标尺寸下「看 → 选 → 进 → 出」纯键盘全流程 +
-    /// FR-03 返回契约（子进程退出必回列表，q 才退出）。
+    /// M1 出口自查：40 列目标尺寸下「看 → 选 → 进」纯键盘全流程 +
+    /// FR-03 v0.2 契约（Enter 产 exec 接管请求，q 才退出）。
     /// 渲染层的 40 列覆盖见 ui::list / ui::layout 的 TestBackend 断言。
     #[test]
     fn m1_exit_criterion_full_walk() {
@@ -3816,28 +3898,17 @@ mod tests {
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.sessions()[app.selected].name, "llm");
 
-        // 进：Enter 的重校验（替身注入新鲜枚举）→ attached → 选择框 → 2 接管。
+        // 进：Enter 的重校验（替身注入新鲜枚举）→ attached → 直接接管（-d -r）。
         app.plan_connect(enumeration(FOUR));
-        assert_eq!(app.mode, Mode::AttachChoice);
-        app.on_key(key(KeyCode::Char('2')));
         let request = app.take_attach_request().expect("attach request");
         assert_eq!(request.kind, AttachKind::Takeover);
         assert_eq!(request.target, "llm");
 
-        // 出：子进程退出（任意退出码）→ 必回列表，TUI 不退出（FR-03 验收 2）。
-        app.note_attach_outcome(
-            &request,
-            &crate::screen::cmd::Run {
-                command: "screen -U -d -r llm".into(),
-                code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-            },
-        );
-        assert_eq!(app.mode, Mode::List);
+        // exec 前落账：进程即将被 screen 替换，不退出、无 UI 痕迹。
+        app.note_attach_intent(&request);
         assert!(!app.should_quit);
 
-        // 唯有 q 退出。
+        // 唯有 q 退出（exec 成功路径根本不会回到事件循环 —— 这里验证纯 TUI 侧契约）。
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
     }

@@ -78,6 +78,16 @@ impl TempFile {
     pub fn read_to_string(&self) -> io::Result<String> {
         fs::read_to_string(&self.path)
     }
+
+    /// 读取并以有损方式解码为 UTF-8：非法字节替换为 U+FFFD。
+    ///
+    /// hardcopy 落盘的是窗口缓冲区的原始字节 —— 会话里跑过的程序可能留下
+    /// 非 UTF-8 序列（latin-1 输出、二进制残留），`read_to_string` 会直接报
+    /// 「stream did not contain valid UTF-8」而把整个预览卡死。预览要的是
+    /// 尽力还原画面，不是严格校验编码，所以这里必须容忍脏字节。
+    pub fn read_lossy(&self) -> String {
+        String::from_utf8_lossy(&fs::read(&self.path).unwrap_or_default()).into_owned()
+    }
 }
 
 impl Drop for TempFile {

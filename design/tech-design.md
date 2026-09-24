@@ -12,7 +12,7 @@
 | 技术栈 | Rust 单二进制 |
 | TUI 框架 | ratatui + crossterm |
 | 并发模型 | 无 async，std 线程 + 事件超时轮询 |
-| 连接方式 | 让出终端，前台 exec `screen`，detach 后自动回 TUI |
+| 连接方式 | `exec` 替换进程进入 `screen`（stui 退出，detach 回原 shell） |
 | Screen 兼容下限 | 4.00.03（无 `-Q`，能力探测 + 降级） |
 | 目标平台 | linux/amd64、linux/arm64（musl 静态，Docker 编译）；macOS arm64/x86_64（本机编译） |
 | 分发 | 仅 GitHub Releases 二进制下载，不做安装脚本 |
@@ -54,12 +54,15 @@ enum Mode {
     NewSession(NewDraft),      // n 新建（单表单：Tab/↑↓ 切字段，Enter 创建，Esc 取消）
     Rename,                    // r 重命名
     Confirm(ConfirmAction),    // kill / wipe / detach 的二次确认
-    AttachChoice,              // attached 会话的 共享/接管/取消
     Help,                      // ? 帮助弹层
     Detail,                    // i 详情弹层（窄屏）
     Preview,                   // p 预览视图
+    Error,                     // 错误弹层（v0.2：错误类消息一律模态，Enter/Esc 关闭）
 }
 ```
+
+> v0.2 修订：移除 `AttachChoice` —— `Enter` 一律接管（attached/multi 用 `-d -r`），
+> 共享由 `x` 键直达（`-x`），不再弹 1/2 选择框。
 
 `Mode` 之间只通过显式事件转换；`Esc` 统一回退上一层，`q` 在 `List` 才退出。渲染层只读 `App`，不改变它 —— 保证任何绘制路径都不能引入副作用。
 
@@ -128,35 +131,43 @@ struct Caps {
 
 ## 3. 核心机制
 
-### 3.1 连接：让出终端（FR-03 的实现契约）
+### 3.1 连接：exec 替换进程（FR-03 的实现契约，v0.2 二修）
 
-这是全工具最关键的交互，必须保证 raw mode / 备用屏幕缓冲区 / 光标状态在**所有**路径下还原：
+这是全工具最关键的交互。v0.2 二修起采用 **`exec` 替换进程**而非 spawn 子进程：
+spawn 方案下 screen 客户端在 TUI 子进程环境里实测接管后秒退 code 1，且「回来重绘 /
+保存-恢复终端」的整条链路都是额外复杂度。exec 后 stui 进程消失，`Ctrl-A D` 断开
+直接回到启动 stui 的 shell —— 等价于在终端手敲 `screen -U -d -r <name>`。
 
 ```rust
-fn attach(app: &mut App, s: &SessionRef, mode: AttachMode) -> Result<i32> {
-    // 1. 重新校验会话仍在且状态匹配（NFR-08）
-    let st = screen::status_of(s)?;
-    ensure_attachable(&st, mode)?;          // dead/unreachable 直接拒绝
+fn attach_exec(app: &mut App, s: &SessionRef, mode: AttachMode) -> io::Error {
+    // 1. 重新校验会话仍在且状态匹配（NFR-08）；exec 前完成全部落账
+    //    （观察记录 / 收藏目录 / 存盘）—— exec 成功后没有「回来再记」的时机。
+    app.note_attach_intent(s);
 
-    // 2. 让出终端：禁 raw mode、离开 alternate screen、显示光标
-    let mut tui = TuiGuard::enter(app.terminal)?;   // RAII
-    tui.suspend()?;
+    // 2. 让出终端：禁 raw mode、离开 alternate screen、显示光标。
+    //    exec 不会自动改 termios —— 不还原，screen 会继承 raw mode 初始化失败。
+    terminal.flush();
+    tui.suspend()?;                         // RAII 责任随 suspend 解除
 
-    // 3. 返回提示（探测到的转义前缀；探测不到则注明"若改过前缀请用前缀+d"）
+    // 3. 返回提示（探测到的转义前缀），落在 shell 滚动缓冲里
     print_detach_hint(app.caps.escape_prefix);
 
-    // 4. 前台执行 screen，继承当前 tty，阻塞至用户 detach
-    let code = match mode {
-        AttachMode::Takeover => screen::cmd(&["-r",  &s.full])   // 或 -d -r
-        AttachMode::Share    => screen::cmd(&["-x",  &s.full]),
-    }?;
+    // 4. exec：成功则本函数【不返回】，进程映像变为 screen 客户端；
+    //    失败（screen 不在 PATH 等）返回 io::Error。
+    let err = screen::cmd::exec_attach(mode, &s.full);
 
-    // 5. 恢复 TUI：重进 alternate screen + raw mode，强制全量重绘
+    // 5. 只有 exec 失败才会到这里：恢复 TUI 终端 + 错误弹层 + 强制全量重绘。
     tui.resume()?;
-    app.refresh();
-    Ok(code)
+    app.set_error(...);
+    Err(err)
 }
 ```
+
+要点：
+1. **不覆写 `TERM`**：screen 客户端需要外层真实终端的 TERM；会话内部的 TERM 由
+   screen 自己设为 `screen[-256color]`（与创建时的 `term_for_session` 是两回事）。
+2. `STY` 必须摘掉（嵌套 screen 会被拒绝）。
+3. attach 期间事件循环整个让位（exec 直接替换进程），不存在「后台仍读事件」的竞态。
 
 **RAII 守护 `TuiGuard`**：`Drop` 里无条件还原终端；另设 `std::panic::set_hook`，panic 时先还原终端再走默认 hook（打印 panic 信息），保证崩溃后终端不报废。`SIGINT`/`SIGTERM` 注册 handler 走正常退出路径。进入备用屏幕（`enter`/`resume`）后先 `Clear(All)` 再首帧：ratatui 是 diff 渲染，不清屏的话备用屏幕上残留的旧内容（shell 输出 / 上次异常退出的画面）不会被覆盖。
 
