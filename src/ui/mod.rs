@@ -182,8 +182,12 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
 
 /// 别名/描述输入弹层（T2.6 / FR-24）。
 fn render_meta_edit(f: &mut Frame<'_>, edit: &crate::app::MetaEdit) {
+    let t = crate::i18n::t();
     let mut lines = vec![
-        Line::from(format!(" {} for '{}':", edit.field.key(), edit.session)),
+        Line::from(crate::i18n::fmt(
+            t.meta_line,
+            &[edit.field.key(), &edit.session],
+        )),
         Line::from(Span::styled(
             format!(" {}", edit.value),
             Style::default().add_modifier(ratatui::style::Modifier::BOLD),
@@ -196,22 +200,20 @@ fn render_meta_edit(f: &mut Frame<'_>, edit: &crate::app::MetaEdit) {
             Style::default().fg(ratatui::style::Color::Red),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        " Enter save · empty clears · Esc cancel",
-        theme::dimmed(),
-    )));
+    lines.push(Line::from(Span::styled(t.meta_hint, theme::dimmed())));
 
     let height = lines.len() as u16 + 2;
     let area = centered_rect(f.area(), 52, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Metadata ")),
+        Paragraph::new(lines).block(Block::bordered().title(t.meta_title)),
         area,
     );
 }
 
 /// `/` 过滤输入框（FR-16）：输入即筛，底下列表实时收缩。
 fn render_filter_input(f: &mut Frame<'_>, app: &App) {
+    let t = crate::i18n::t();
     let visible = app.sessions().len();
     let total = app.all_sessions().len();
     let lines = vec![
@@ -221,19 +223,16 @@ fn render_filter_input(f: &mut Frame<'_>, app: &App) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!(" {visible} of {total} sessions match"),
+            crate::i18n::fmt(t.filter_match, &[&visible.to_string(), &total.to_string()]),
             theme::dimmed(),
         )),
-        Line::from(Span::styled(
-            " Enter apply · Esc clear filter",
-            theme::dimmed(),
-        )),
+        Line::from(Span::styled(t.filter_hint, theme::dimmed())),
     ];
     let height = lines.len() as u16 + 2;
     let area = centered_rect(f.area(), 40, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Filter ")),
+        Paragraph::new(lines).block(Block::bordered().title(t.filter_title)),
         area,
     );
 }
@@ -241,18 +240,19 @@ fn render_filter_input(f: &mut Frame<'_>, app: &App) {
 /// 危险操作确认框（FR-13）：显示会话名 + 探测到的运行命令，
 /// 默认焦点在**取消**（小屏误触防线），后果动词显式标出。
 fn render_confirm(f: &mut Frame<'_>, confirm: &crate::app::ConfirmAction) {
+    let t = crate::i18n::t();
     let mut lines = vec![
         Line::from(Span::styled(
-            format!(" Confirm: {}", confirm.kind.consequence()),
+            crate::i18n::fmt(t.confirm_title, &[confirm.kind.consequence()]),
             Style::default()
                 .fg(ratatui::style::Color::Red)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(format!(" session: {}", confirm.display)),
+        Line::from(crate::i18n::fmt(t.confirm_session, &[&confirm.display])),
     ];
     if let Some(command) = &confirm.command {
-        lines.push(Line::from(format!(" command: {command}")));
+        lines.push(Line::from(crate::i18n::fmt(t.confirm_command, &[command])));
     }
     lines.push(Line::from(""));
 
@@ -263,13 +263,10 @@ fn render_confirm(f: &mut Frame<'_>, confirm: &crate::app::ConfirmAction) {
         (Style::default(), theme::selected_row())
     };
     lines.push(Line::from(vec![
-        Span::styled(" [ Yes ] ", yes_style),
-        Span::styled(" [ Cancel ] ", no_style),
+        Span::styled(t.confirm_yes, yes_style),
+        Span::styled(t.confirm_cancel, no_style),
     ]));
-    lines.push(Line::from(Span::styled(
-        " ←/→ switch focus · Enter run focused · y confirm · Esc cancel",
-        theme::dimmed(),
-    )));
+    lines.push(Line::from(Span::styled(t.confirm_hint, theme::dimmed())));
 
     let height = lines.len() as u16 + 2;
     let area = centered_rect(f.area(), 62, height);
@@ -283,8 +280,9 @@ fn render_confirm(f: &mut Frame<'_>, confirm: &crate::app::ConfirmAction) {
 
 /// 重命名输入框（FR-14）。
 fn render_rename(f: &mut Frame<'_>, draft: &crate::app::RenameDraft) {
+    let t = crate::i18n::t();
     let mut lines = vec![
-        Line::from(" New name:"),
+        Line::from(t.rename_new_name),
         Line::from(Span::styled(
             format!(" {}", draft.name),
             Style::default().add_modifier(ratatui::style::Modifier::BOLD),
@@ -297,25 +295,23 @@ fn render_rename(f: &mut Frame<'_>, draft: &crate::app::RenameDraft) {
             Style::default().fg(ratatui::style::Color::Red),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        " Enter rename · Esc cancel",
-        theme::dimmed(),
-    )));
+    lines.push(Line::from(Span::styled(t.rename_hint, theme::dimmed())));
 
     let height = lines.len() as u16 + 2;
     let area = centered_rect(f.area(), 46, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Rename ")),
+        Paragraph::new(lines).block(Block::bordered().title(t.rename_title)),
         area,
     );
 }
 
 /// attached 冲突选择框（1.5b）：1 共享 / 2 接管 / Esc 取消。
 fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
+    let t = crate::i18n::t();
     let mut lines = vec![
         Line::from(Span::styled(
-            format!(" '{}' is attached", choice.name),
+            crate::i18n::fmt(t.attach_line, &[&choice.name]),
             Style::default().add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
@@ -324,14 +320,14 @@ fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
                 " 1 ",
                 Style::default().add_modifier(ratatui::style::Modifier::BOLD),
             ),
-            Span::raw("share (-x)"),
+            Span::raw(t.attach_share.to_string()),
         ]),
         Line::from(vec![
             Span::styled(
                 " 2 ",
                 Style::default().add_modifier(ratatui::style::Modifier::BOLD),
             ),
-            Span::raw("takeover (-d -r)"),
+            Span::raw(t.attach_takeover.to_string()),
         ]),
         Line::from(""),
     ];
@@ -342,7 +338,7 @@ fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
         )));
     }
     lines.push(Line::from(Span::styled(
-        " 1/2 choose · Esc cancel".to_string(),
+        t.attach_hint.to_string(),
         theme::dimmed(),
     )));
 
@@ -350,7 +346,7 @@ fn render_attach_choice(f: &mut Frame<'_>, choice: &crate::app::AttachChoice) {
     let area = centered_rect(f.area(), 44, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Attached ")),
+        Paragraph::new(lines).block(Block::bordered().title(t.attach_title)),
         area,
     );
 }
@@ -423,39 +419,37 @@ fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout
     let mut rows: Vec<Line<'static>> = match tier {
         // 宽屏：2 行完整快捷键（FR-04）。
         Tier::Wide => {
-            let mut first = vec![Span::styled(
-                " j/k move  Enter attach  1-9 quick  n new  x share  i detail  R refresh"
-                    .to_string(),
-                theme::dimmed(),
-            )];
-            let mut second = vec![Span::styled(
-                " / filter  D detach  K kill  r rename  W wipe(dead)  s restart  X cleanup  ? help  q quit".to_string(),
-                theme::dimmed(),
-            )];
-            let mut info = format!(" refresh every {}s", app.refresh_interval.as_secs());
+            let t = crate::i18n::t();
+            let mut first = vec![Span::styled(t.footer_wide_1.to_string(), theme::dimmed())];
+            let mut second = vec![Span::styled(t.footer_wide_2.to_string(), theme::dimmed())];
+            let mut info = crate::i18n::fmt(
+                t.footer_refresh,
+                &[&app.refresh_interval.as_secs().to_string()],
+            );
             if let Some(dir) = app.socket_dir() {
                 info.push_str(&format!(" · socket {dir}"));
             }
             second.push(Span::styled(info, theme::dimmed()));
             if has_dead {
-                first.push(Span::styled("  W wipe dead", theme::dimmed()));
+                first.push(Span::styled(
+                    t.footer_wipe_dead.to_string(),
+                    theme::dimmed(),
+                ));
             }
             vec![Line::from(first), Line::from(second)]
         }
         // 中屏 / 窄屏：1 行精简。
         Tier::Mid | Tier::Narrow => {
-            let mut spans = vec![Span::styled(
-                " n new  1-9 attach  i detail  / find  K kill  ? help  q quit".to_string(),
-                theme::dimmed(),
-            )];
+            let t = crate::i18n::t();
+            let mut spans = vec![Span::styled(t.footer_mid.to_string(), theme::dimmed())];
             if has_dead && tier == Tier::Mid {
-                spans.push(Span::styled("  W wipe", theme::dimmed()));
+                spans.push(Span::styled(t.footer_wipe.to_string(), theme::dimmed()));
             }
             vec![Line::from(spans)]
         }
         // 极小屏：只留退出与帮助入口（帮助折叠为 ? 弹层，FR-04/05）。
         Tier::Tiny => vec![Line::from(vec![Span::styled(
-            " ? help  q quit".to_string(),
+            crate::i18n::t().footer_tiny.to_string(),
             theme::dimmed(),
         )])],
     };
@@ -501,14 +495,14 @@ fn header_widget(app: &App) -> Paragraph<'static> {
             " stui".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "  {} session(s) · {attached} attached",
-            sessions.len()
+        Span::raw(crate::i18n::fmt(
+            crate::i18n::t().header_sessions,
+            &[&sessions.len().to_string(), &attached.to_string()],
         )),
     ];
     if dead > 0 {
         line.push(Span::styled(
-            format!(" · {dead} dead"),
+            crate::i18n::fmt(crate::i18n::t().header_dead, &[&dead.to_string()]),
             Style::default().fg(ratatui::style::Color::Red),
         ));
     }
@@ -527,30 +521,22 @@ fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
     render_list_screen(f, app);
 
     let area = centered_rect(f.area(), 52, 15);
+    let t = crate::i18n::t();
     let lines = vec![
-        Line::from(vec![help_key("j/k / ↑/↓"), help_desc(" move selection")]),
-        Line::from(vec![help_key("Enter"), help_desc("     attach selected")]),
-        Line::from(vec![
-            help_key("1-9"),
-            help_desc("        quick attach by row"),
-        ]),
-        Line::from(vec![help_key("x"), help_desc("        share attach (-x)")]),
-        Line::from(vec![help_key("p"), help_desc("        preview snapshot")]),
-        Line::from(vec![help_key("n"), help_desc("        new session")]),
-        Line::from(vec![
-            help_key("i"),
-            help_desc("        detail of selection"),
-        ]),
-        Line::from(vec![help_key("/"), help_desc("        filter sessions")]),
-        Line::from(vec![help_key("D"), help_desc("        remote detach")]),
-        Line::from(vec![help_key("K"), help_desc("        kill (confirm)")]),
-        Line::from(vec![help_key("r"), help_desc("        rename")]),
-        Line::from(vec![
-            help_key("W"),
-            help_desc("        wipe dead (confirm)"),
-        ]),
-        Line::from(vec![help_key("R"), help_desc("        refresh now")]),
-        Line::from(vec![help_key("q / Esc"), help_desc("  quit / close")]),
+        Line::from(vec![help_key("j/k / ↑/↓"), help_desc(t.desc_move)]),
+        Line::from(vec![help_key("Enter"), help_desc(t.desc_attach)]),
+        Line::from(vec![help_key("1-9"), help_desc(t.desc_quick)]),
+        Line::from(vec![help_key("x"), help_desc(t.desc_share)]),
+        Line::from(vec![help_key("p"), help_desc(t.desc_preview)]),
+        Line::from(vec![help_key("n"), help_desc(t.desc_new)]),
+        Line::from(vec![help_key("i"), help_desc(t.desc_detail)]),
+        Line::from(vec![help_key("/"), help_desc(t.desc_filter)]),
+        Line::from(vec![help_key("D"), help_desc(t.desc_detach)]),
+        Line::from(vec![help_key("K"), help_desc(t.desc_kill)]),
+        Line::from(vec![help_key("r"), help_desc(t.desc_rename)]),
+        Line::from(vec![help_key("W"), help_desc(t.desc_wipe)]),
+        Line::from(vec![help_key("R"), help_desc(t.desc_refresh)]),
+        Line::from(vec![help_key("q / Esc"), help_desc(t.desc_quit)]),
         Line::from(""),
         Line::from(Span::styled(
             format!(
@@ -558,14 +544,14 @@ fn render_help_overlay(f: &mut Frame<'_>, app: &App) {
                 app.caps
                     .version_text
                     .as_deref()
-                    .unwrap_or("version unknown")
+                    .unwrap_or(t.version_unknown)
             ),
             theme::dimmed(),
         )),
     ];
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Help ")),
+        Paragraph::new(lines).block(Block::bordered().title(t.help_title)),
         area,
     );
 }
@@ -597,12 +583,12 @@ fn render_detail_overlay(f: &mut Frame<'_>, app: &App) {
     // 元数据编辑入口提示（T2.6 / FR-24）。
     text.push(Line::from(""));
     text.push(Line::from(Span::styled(
-        " a alias · t note · Esc close",
+        crate::i18n::t().detail_hint,
         theme::dimmed(),
     )));
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(text).block(Block::bordered().title(" Detail ")),
+        Paragraph::new(text).block(Block::bordered().title(crate::i18n::t().detail_title)),
         area,
     );
 }

@@ -99,41 +99,49 @@ impl RowCols {
 /// 取不到的字段直接不出现该行 —— 显示「无」就是编造（C-5）。
 /// `meta` 是 T2.2 的探测结果（cwd / command），`None` 时两行都不出现；
 /// `windows` 是 `-Q windows` 结果（FR-17），能力不可用时调用方传 `None`，该行隐藏。
+///
+/// 字段标签走 i18n（FR-25），按显示宽度补齐到同一列（英文 10 列不变，
+/// 中文标签更窄，补齐后仍对齐）。
 pub fn detail_lines(
     session: &SessionRecord,
     meta: Option<&crate::screen::probe::Meta>,
     windows: Option<usize>,
     user_meta: Option<&crate::config::SessionMeta>,
 ) -> Vec<String> {
-    let mut lines = vec![format!("name      {}", session.name)];
-    lines.push(format!("address   {}", session.full));
+    use crate::util::width::pad_right;
+
+    let t = crate::i18n::t();
+    let field = |label: &str, value: &str| format!("{}{value}", pad_right(label, 10));
+
+    let mut lines = vec![field(t.dl_name, &session.name)];
+    lines.push(field(t.dl_address, &session.full));
     if let Some(pid) = session.pid {
-        lines.push(format!("pid       {pid}"));
+        lines.push(field(t.dl_pid, &pid.to_string()));
     }
-    lines.push(format!("status    {}", session.status.label()));
+    lines.push(field(t.dl_status, &session.status.label()));
     if let Some(created) = &session.created {
-        lines.push(format!("created   {created}"));
+        lines.push(field(t.dl_created, created));
     }
     if let Some(windows) = windows {
-        lines.push(format!("windows   {windows}"));
+        lines.push(field(t.dl_windows, &windows.to_string()));
     }
     if let Some(meta) = meta {
         if let Some(cwd) = &meta.cwd {
-            lines.push(format!("cwd       {cwd}"));
+            lines.push(field(t.dl_cwd, cwd));
         }
         if let Some(command) = &meta.command {
-            lines.push(format!("command   {command}"));
+            lines.push(field(t.dl_command, command));
         }
     }
     if let Some(user) = user_meta {
         if let Some(alias) = &user.alias {
-            lines.push(format!("alias     {alias}"));
+            lines.push(field(t.dl_alias, alias));
         }
         if let Some(note) = &user.note {
-            lines.push(format!("note      {note}"));
+            lines.push(field(t.dl_note, note));
         }
         if user.managed {
-            lines.push("managed   yes (created by stui; restart with s)".to_string());
+            lines.push(field(t.dl_managed, t.dl_managed_yes));
         }
     }
     lines

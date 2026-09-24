@@ -71,10 +71,11 @@ impl NewField {
     }
 
     pub fn label(self) -> &'static str {
+        let t = crate::i18n::t();
         match self {
-            NewField::Name => "Name",
-            NewField::Dir => "Directory",
-            NewField::Command => "Command",
+            NewField::Name => t.f_name,
+            NewField::Dir => t.f_dir,
+            NewField::Command => t.f_command,
         }
     }
 
@@ -124,19 +125,18 @@ pub struct NewDraft {
 /// 会话名校验（纯函数）：空名 / 前导 `-`（会被 screen 当选项）/ 空白与控制字符 /
 /// 超长即时报错；重名不在此拦 —— 见 `NewDraft::note`。
 pub fn validate_name(name: &str) -> Result<(), String> {
+    let t = crate::i18n::t();
     if name.is_empty() {
-        return Err("name must not be empty".into());
+        return Err(t.name_empty.into());
     }
     if name.starts_with('-') {
-        return Err("name must not start with '-' (screen would read it as an option)".into());
+        return Err(t.name_leading_dash.into());
     }
     if let Some(bad) = name.chars().find(|c| c.is_control() || c.is_whitespace()) {
-        return Err(format!(
-            "name must not contain whitespace or control characters (found {bad:?})"
-        ));
+        return Err(crate::i18n::fmt(t.name_bad_char, &[&format!("{bad:?}")]));
     }
     if name.chars().count() > NAME_MAX {
-        return Err(format!("name is longer than {NAME_MAX} characters"));
+        return Err(crate::i18n::fmt(t.name_too_long, &[&NAME_MAX.to_string()]));
     }
     Ok(())
 }
@@ -243,21 +243,23 @@ pub enum ActionKind {
 
 impl ActionKind {
     pub fn label(self) -> &'static str {
+        let t = crate::i18n::t();
         match self {
-            ActionKind::Detach => "detach",
-            ActionKind::Kill => "kill",
-            ActionKind::Wipe => "wipe",
-            ActionKind::Cleanup => "cleanup",
+            ActionKind::Detach => t.act_detach,
+            ActionKind::Kill => t.act_kill,
+            ActionKind::Wipe => t.act_wipe,
+            ActionKind::Cleanup => t.act_cleanup,
         }
     }
 
     /// 确认框的动词描述（危险操作要把后果说清楚）。
     pub fn consequence(self) -> &'static str {
+        let t = crate::i18n::t();
         match self {
-            ActionKind::Detach => "detach the attached client (it keeps running)",
-            ActionKind::Kill => "TERMINATE the session and all its windows",
-            ActionKind::Wipe => "remove all dead session sockets",
-            ActionKind::Cleanup => "forget metadata of sessions that no longer exist",
+            ActionKind::Detach => t.consequence_detach,
+            ActionKind::Kill => t.consequence_kill,
+            ActionKind::Wipe => t.consequence_wipe,
+            ActionKind::Cleanup => t.consequence_cleanup,
         }
     }
 
@@ -341,9 +343,10 @@ pub enum MetaField {
 
 impl MetaField {
     pub fn key(self) -> &'static str {
+        let t = crate::i18n::t();
         match self {
-            MetaField::Alias => "alias",
-            MetaField::Note => "note",
+            MetaField::Alias => t.meta_alias,
+            MetaField::Note => t.meta_note,
         }
     }
 }
@@ -405,12 +408,10 @@ pub fn detect_escape_prefix() -> Option<String> {
 
 /// detach 提示（FR-18 验收）：探测到实际前缀时按它提示，否则回退默认并注明。
 pub fn detach_hint_text(prefix: Option<&str>) -> String {
+    let t = crate::i18n::t();
     match prefix {
-        Some(p) => format!("Tip: detach with {p} d"),
-        None => {
-            "Tip: detach with Ctrl-A D (default prefix - use your own prefix + d if you changed it)"
-                .into()
-        }
+        Some(p) => crate::i18n::fmt(t.detach_hint_some, &[p]),
+        None => t.detach_hint_default.into(),
     }
 }
 
@@ -643,7 +644,10 @@ impl App {
                 self.status = None;
             }
             Err(err) => {
-                self.status = Some(format!("refresh failed: {err}"));
+                self.status = Some(crate::i18n::fmt(
+                    crate::i18n::t().refresh_failed,
+                    &[&err.to_string()],
+                ));
             }
         }
         self.last_refresh = Some(Instant::now());
@@ -693,21 +697,29 @@ impl App {
                 self.apply_enumeration(fresh);
                 match status {
                     Some(Status::Dead | Status::Unreachable) => {
-                        self.status = Some(format!("'{name}' is not connectable; cannot share"));
+                        self.status = Some(crate::i18n::fmt(
+                            crate::i18n::t().not_connectable_share,
+                            &[&name],
+                        ));
                     }
                     Some(Status::Unknown(raw)) => {
-                        self.status = Some(format!(
-                            "'{name}' reports unknown state '{raw}'; refusing to connect"
+                        self.status = Some(crate::i18n::fmt(
+                            crate::i18n::t().unknown_state,
+                            &[&name, &raw],
                         ));
                     }
                     Some(_) => self.request_attach(AttachKind::Share, name),
                     None => {
-                        self.status = Some(format!("session '{name}' is gone; list refreshed"));
+                        self.status =
+                            Some(crate::i18n::fmt(crate::i18n::t().session_gone, &[&name]));
                     }
                 }
             }
             Err(err) => {
-                self.status = Some(format!("cannot verify sessions before connecting: {err}"));
+                self.status = Some(crate::i18n::fmt(
+                    crate::i18n::t().verify_failed,
+                    &[&err.to_string()],
+                ));
             }
         }
     }
@@ -822,7 +834,10 @@ impl App {
         match (self.enumerate)() {
             Ok(fresh) => self.plan_connect(fresh),
             Err(err) => {
-                self.status = Some(format!("cannot verify sessions before connecting: {err}"));
+                self.status = Some(crate::i18n::fmt(
+                    crate::i18n::t().verify_failed,
+                    &[&err.to_string()],
+                ));
             }
         }
     }
@@ -843,7 +858,7 @@ impl App {
         match fresh_status {
             None => {
                 // 会话已消失：明确提示 + 刷新，不卡死（FR-03 验收 3）。
-                self.status = Some(format!("session '{name}' is gone; list refreshed"));
+                self.status = Some(crate::i18n::fmt(crate::i18n::t().session_gone, &[&name]));
                 self.apply_enumeration(fresh);
             }
             Some(status) => {
@@ -857,25 +872,25 @@ impl App {
                     Status::Multi => {
                         self.attach = Some(AttachChoice {
                             name,
-                            note: Some(
-                                "multi-display session: terminals may resize each other".into(),
-                            ),
+                            note: Some(crate::i18n::t().multi_note.into()),
                         });
                         self.mode = Mode::AttachChoice;
                     }
                     // dead / unreachable 拒连（FR-03 表）。
                     Status::Dead => {
-                        self.status = Some(format!(
-                            "'{name}' is dead; wipe it before connecting (wipe lands in M2)"
-                        ));
+                        self.status =
+                            Some(crate::i18n::fmt(crate::i18n::t().dead_wipe_hint, &[&name]));
                     }
                     Status::Unreachable => {
-                        self.status =
-                            Some(format!("'{name}' is unreachable; check the socket dir"));
+                        self.status = Some(crate::i18n::fmt(
+                            crate::i18n::t().unreachable_hint,
+                            &[&name],
+                        ));
                     }
                     Status::Unknown(raw) => {
-                        self.status = Some(format!(
-                            "'{name}' reports unknown state '{raw}'; refusing to connect"
+                        self.status = Some(crate::i18n::fmt(
+                            crate::i18n::t().unknown_state,
+                            &[&name, &raw],
                         ));
                     }
                 }
@@ -949,12 +964,11 @@ impl App {
         }
         self.save_config();
         self.status = Some(if run.success() {
-            format!("detached from '{}'", request.target)
+            crate::i18n::fmt(crate::i18n::t().detached_from, &[&request.target])
         } else {
-            format!(
-                "screen exited with code {} ({})",
-                run.code,
-                request.kind.label()
+            crate::i18n::fmt(
+                crate::i18n::t().screen_exit_code,
+                &[&run.code.to_string(), request.kind.label()],
             )
         });
     }
@@ -968,17 +982,16 @@ impl App {
             return;
         };
         if matches!(session.status, Status::Dead | Status::Unreachable) {
-            self.status = Some(format!(
-                "'{}' is not running; there is nothing to preview",
-                session.name
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().preview_not_running,
+                &[&session.name],
             ));
             return;
         }
         if !self.caps.hardcopy.usable() {
-            self.status = Some(format!(
-                "preview unavailable: hardcopy support is {} on this screen build \
-                 (run `stui doctor` for details)",
-                self.caps.hardcopy.label()
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().preview_unavailable,
+                &[self.caps.hardcopy.label()],
             ));
             return;
         }
@@ -1092,30 +1105,30 @@ impl App {
             return;
         };
         if session.status != Status::Dead {
-            self.status = Some(format!(
-                "'{}' is still running; restart applies to dead sessions",
-                session.name
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().restart_still_running,
+                &[&session.name],
             ));
             return;
         }
         let Some(meta) = self.config.sessions.get(&session.name).cloned() else {
-            self.status = Some(format!(
-                "'{}' was not created by stui; restart is unavailable",
-                session.name
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().restart_not_managed,
+                &[&session.name],
             ));
             return;
         };
         if !meta.managed {
-            self.status = Some(format!(
-                "'{}' is unmanaged; restart is only available for sessions created by stui",
-                session.name
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().restart_unmanaged,
+                &[&session.name],
             ));
             return;
         }
         let (Some(command), Some(cwd)) = (meta.command.clone(), meta.cwd.clone()) else {
-            self.status = Some(format!(
-                "'{}' has no recorded command/cwd; cannot restart",
-                session.name
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().restart_no_record,
+                &[&session.name],
             ));
             return;
         };
@@ -1137,16 +1150,14 @@ impl App {
             );
             self.config.touch_dir(&request.dir.display().to_string());
             self.save_config();
-            self.status = Some(format!(
-                "restarted '{}' with its recorded command",
-                request.name
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().restarted,
+                &[&request.name],
             ));
         } else {
-            self.status = Some(format!(
-                "restart of '{}' failed (exit {}): {}",
-                request.name,
-                run.code,
-                run.text().trim()
+            self.status = Some(crate::i18n::fmt(
+                crate::i18n::t().restart_failed,
+                &[&request.name, &run.code.to_string(), run.text().trim()],
             ));
         }
     }
@@ -1161,14 +1172,14 @@ impl App {
     fn open_cleanup(&mut self) {
         let stale = self.stale_metadata_names();
         if stale.is_empty() {
-            self.status = Some("no stale session metadata to clean".into());
+            self.status = Some(crate::i18n::t().no_stale_metadata.into());
             return;
         }
         let count = stale.len();
         self.confirm = Some(ConfirmAction {
             kind: ActionKind::Cleanup,
             target: String::new(),
-            display: format!("{count} stale metadata entrie(s)"),
+            display: crate::i18n::fmt(crate::i18n::t().stale_entries, &[&count.to_string()]),
             command: Some(stale.join(", ")),
             focus_yes: false,
         });
@@ -1194,11 +1205,9 @@ impl App {
         }
         let saved = self.save_config();
         self.status = Some(if saved {
-            format!("removed {count} stale metadata entrie(s)")
+            crate::i18n::fmt(crate::i18n::t().removed_stale, &[&count.to_string()])
         } else {
-            format!(
-                "removed {count} stale metadata entrie(s) for this session only (no config file written)"
-            )
+            crate::i18n::fmt(crate::i18n::t().removed_stale_ro, &[&count.to_string()])
         });
     }
 
@@ -1259,11 +1268,9 @@ impl App {
                 self.meta_edit = None;
                 self.mode = Mode::List;
                 self.status = Some(if saved {
-                    format!("'{session}' {field_label} updated")
+                    crate::i18n::fmt(crate::i18n::t().meta_updated, &[&session, &field_label])
                 } else {
-                    format!(
-                        "'{session}' {field_label} kept for this session only (no config file written)"
-                    )
+                    crate::i18n::fmt(crate::i18n::t().meta_kept_ro, &[&session, &field_label])
                 });
             }
             _ => self.meta_edit = Some(edit),
@@ -1280,13 +1287,13 @@ impl App {
             ActionKind::Cleanup => return,
             ActionKind::Wipe => {
                 if !self.sessions().iter().any(|s| s.status == Status::Dead) {
-                    self.status = Some("no dead sessions; nothing to wipe".into());
+                    self.status = Some(crate::i18n::t().no_dead_to_wipe.into());
                     return;
                 }
                 self.confirm = Some(ConfirmAction {
                     kind,
                     target: String::new(),
-                    display: "dead sessions".into(),
+                    display: crate::i18n::t().dead_sessions_display.into(),
                     command: None,
                     focus_yes: false, // 默认焦点在取消（FR-13 验收 1）。
                 });
@@ -1299,9 +1306,9 @@ impl App {
                 if kind == ActionKind::Detach
                     && !matches!(session.status, Status::Attached | Status::Multi)
                 {
-                    self.status = Some(format!(
-                        "'{}' is not attached; nothing to detach (use Enter to connect)",
-                        session.name
+                    self.status = Some(crate::i18n::fmt(
+                        crate::i18n::t().not_attached,
+                        &[&session.name],
                     ));
                     return;
                 }
@@ -1385,23 +1392,28 @@ impl App {
         match action.kind {
             ActionKind::Wipe => {
                 if dead_count == 0 {
-                    Err("no dead sessions left; nothing to wipe".into())
+                    Err(crate::i18n::t().no_dead_left.into())
                 } else {
                     Ok(())
                 }
             }
             ActionKind::Kill => match found {
                 Some(_) => Ok(()),
-                None => Err(format!("'{}' is gone; nothing to kill", action.display)),
+                None => Err(crate::i18n::fmt(
+                    crate::i18n::t().gone_kill,
+                    &[&action.display],
+                )),
             },
             ActionKind::Detach => match found {
                 Some(Status::Attached | Status::Multi) => Ok(()),
-                Some(other) => Err(format!(
-                    "'{}' is no longer attached (now {}); nothing to detach",
-                    action.display,
-                    other.label()
+                Some(other) => Err(crate::i18n::fmt(
+                    crate::i18n::t().no_longer_attached,
+                    &[&action.display, &other.label()],
                 )),
-                None => Err(format!("'{}' is gone; nothing to detach", action.display)),
+                None => Err(crate::i18n::fmt(
+                    crate::i18n::t().gone_detach,
+                    &[&action.display],
+                )),
             },
             // Cleanup 只动本工具的配置，无 screen 语义可校验；确认框内直接执行，
             // 正常不会走到这里（防御性放行）。
@@ -1414,22 +1426,27 @@ impl App {
         self.refresh();
         self.status = Some(if run.success() {
             match action.kind {
-                ActionKind::Wipe => "dead sessions wiped".to_string(),
-                _ => format!("'{}' {} done", action.display, action.kind.label()),
+                ActionKind::Wipe => crate::i18n::t().wiped.to_string(),
+                _ => crate::i18n::fmt(
+                    crate::i18n::t().action_done,
+                    &[&action.display, action.kind.label()],
+                ),
             }
         } else {
             let detail = run.text();
             let detail = detail.trim();
-            format!(
-                "{} '{}' failed (exit {}){}",
-                action.kind.label(),
-                action.display,
-                run.code,
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {detail}")
-                }
+            crate::i18n::fmt(
+                crate::i18n::t().action_failed,
+                &[
+                    action.kind.label(),
+                    &action.display,
+                    &run.code.to_string(),
+                    &if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    },
+                ],
             )
         });
     }
@@ -1496,9 +1513,12 @@ impl App {
     pub fn note_rename_outcome(&mut self, request: &RenameRequest, run: &cmd::Run) {
         self.refresh();
         self.status = Some(if run.success() {
-            format!("session renamed to '{}'", request.new_name)
+            crate::i18n::fmt(crate::i18n::t().renamed_to, &[&request.new_name])
         } else {
-            format!("rename failed (exit {}): {}", run.code, run.text().trim())
+            crate::i18n::fmt(
+                crate::i18n::t().rename_failed,
+                &[&run.code.to_string(), run.text().trim()],
+            )
         });
     }
 
@@ -1706,7 +1726,10 @@ impl App {
             // 名字没被动过：用最新列表再确认一次（NFR-08「列表不可信，动作前重验」）。
             let refit = self.refit_default_name(&draft.name_base, &draft.name);
             if refit != draft.name {
-                draft.note = Some(format!("'{}' was taken; used '{refit}'", draft.name));
+                draft.note = Some(crate::i18n::fmt(
+                    crate::i18n::t().name_was_taken,
+                    &[&draft.name, &refit],
+                ));
                 draft.name = refit;
             }
         }
@@ -1724,8 +1747,10 @@ impl App {
                 // 先刷新再落账：refresh() 成功时会清掉瞬态消息，结果消息必须留在最后。
                 self.refresh();
                 self.status = Some(match note {
-                    Some(hint) => format!("created '{name}' ({hint})"),
-                    None => format!("created '{name}'"),
+                    Some(hint) => {
+                        crate::i18n::fmt(crate::i18n::t().created_with_hint, &[&name, &hint])
+                    }
+                    None => crate::i18n::fmt(crate::i18n::t().created, &[&name]),
                 });
                 if self.config.defaults.attach_after_create {
                     self.auto_enter_created(&name);
@@ -1747,9 +1772,9 @@ impl App {
     fn auto_enter_created(&mut self, name: &str) {
         let matches = self.sessions().iter().filter(|s| s.name == name).count();
         let skip_reason = match matches {
-            0 => Some("it is not in the session list yet"),
+            0 => Some(crate::i18n::t().skip_not_listed),
             1 => None,
-            _ => Some("the name is not unique; start it as <pid>.<name>"),
+            _ => Some(crate::i18n::t().skip_not_unique),
         };
         match skip_reason {
             // 用刚刷新过的那份列表交给连接闭环重校验，不再额外枚举一次。
@@ -1764,13 +1789,14 @@ impl App {
 
     /// 自动进入被跳过时，把原因追加到「已创建」这条消息后面 —— 创建本身成功，不覆盖这个事实。
     fn note_auto_enter_skipped(&mut self, name: &str, reason: &str) {
-        let created = format!("created '{name}'");
+        let t = crate::i18n::t();
+        let created = crate::i18n::fmt(t.created, &[name]);
         let base = self
             .status
             .take()
             .filter(|status| status.starts_with(&created))
             .unwrap_or(created);
-        self.status = Some(format!("{base}; not entering: {reason}"));
+        self.status = Some(crate::i18n::fmt(t.not_entering, &[&base, reason]));
     }
 
     /// 提交前确认默认名（FR-02 验收 1）。
@@ -1794,7 +1820,7 @@ impl App {
         self.sessions()
             .iter()
             .any(|s| s.name == name)
-            .then(|| format!("a session named '{name}' already exists; address it as <pid>.{name}"))
+            .then(|| crate::i18n::fmt(crate::i18n::t().duplicate_note, &[name]))
     }
 
     /// 执行创建并刷新列表。成功返回新会话在（刷新后）列表中的下标。
@@ -1802,22 +1828,27 @@ impl App {
     /// 这里只负责「建出来 + 把选中项对准它 + 记元数据」；要不要直接进去由
     /// [`App::auto_enter_created`] 在拿到刷新后的列表之后再决定（FR-02 验收 4）。
     fn create_session(&mut self, name: &str, dir: &str, command: &str) -> Result<usize, String> {
+        let t = crate::i18n::t();
         let path = std::path::PathBuf::from(dir);
-        let run =
-            (self.create)(name, &path, command).map_err(|err| format!("create failed: {err}"))?;
+        let run = (self.create)(name, &path, command)
+            .map_err(|err| crate::i18n::fmt(t.create_failed, &[&err.to_string()]))?;
 
         if !run.success() {
             let detail = run.text();
             let detail = detail.trim();
-            return Err(format!(
-                "screen refused to create '{name}' (exit {}):\n  {} ran in {dir}\n  {}",
-                run.code,
-                run.command,
-                if detail.is_empty() {
-                    "screen produced no diagnostic output; check the name and directory"
-                } else {
-                    detail
-                }
+            return Err(crate::i18n::fmt(
+                t.screen_refused,
+                &[
+                    name,
+                    &run.code.to_string(),
+                    &run.command,
+                    dir,
+                    &if detail.is_empty() {
+                        t.screen_no_diagnostic.to_string()
+                    } else {
+                        detail.to_string()
+                    },
+                ],
             ));
         }
 
@@ -1852,15 +1883,16 @@ impl App {
 /// Name 与 Directory 沿用各自的原有口径；Command **没有**阻断性错误 ——
 /// 留空等于落回默认 shell（FR-02），清空字段是合法动作。
 fn check_field(draft: &NewDraft, field: NewField) -> Result<(), String> {
+    let t = crate::i18n::t();
     match field {
         NewField::Name => validate_name(draft.name.trim()),
         NewField::Dir => {
             let dir = expand_tilde(draft.dir.trim());
             if dir.is_empty() {
-                return Err("directory must not be empty".into());
+                return Err(t.dir_empty.into());
             }
             if !std::path::Path::new(&dir).is_dir() {
-                return Err(format!("not a directory: {dir}"));
+                return Err(crate::i18n::fmt(t.not_a_directory, &[&dir]));
             }
             Ok(())
         }
@@ -1925,9 +1957,7 @@ pub fn run() -> u8 {
     };
     // $STY 非空 = 已经在一个 screen 会话里（FR-03 验收 5）：警告一次，不阻塞。
     if std::env::var("STY").map(|v| !v.is_empty()).unwrap_or(false) {
-        app.status = Some(
-            "already inside a screen session ($STY); nested connections can be confusing".into(),
-        );
+        app.status = Some(crate::i18n::t().inside_sty.into());
     }
     app.refresh();
     // 配置警告在首帧后给出（refresh 会清瞬态消息，这条必须在它之后落）。
@@ -1985,7 +2015,10 @@ fn event_loop(
                 Ok(run) => app.note_attach_outcome(&request, &run),
                 Err(err) => {
                     app.mode = Mode::List;
-                    app.status = Some(format!("attach failed: {err}"));
+                    app.status = Some(crate::i18n::fmt(
+                        crate::i18n::t().attach_failed,
+                        &[&err.to_string()],
+                    ));
                 }
             }
             // 子进程画过屏幕：清掉 ratatui 的 diff 基线，强制整屏重绘。
@@ -1996,9 +2029,9 @@ fn event_loop(
         if let Some(action) = app.take_action() {
             let validation = match (app.enumerate)() {
                 Ok(fresh) => app.validate_action(fresh, &action),
-                Err(err) => Err(format!(
-                    "cannot verify sessions before {}: {err}",
-                    action.kind.label()
+                Err(err) => Err(crate::i18n::fmt(
+                    crate::i18n::t().verify_failed_action,
+                    &[action.kind.label(), &err.to_string()],
                 )),
             };
             match validation {
@@ -2007,11 +2040,14 @@ fn event_loop(
                         Ok(run) => app.note_action_outcome(&action, &run),
                         Err(err) => {
                             app.refresh();
-                            app.status = Some(format!("{} failed: {err}", action.kind.label()));
+                            app.status = Some(crate::i18n::fmt(
+                                crate::i18n::t().action_failed_short,
+                                &[action.kind.label(), &err.to_string()],
+                            ));
                         }
                     },
                     // Cleanup 在确认框内直接执行，不产动作请求（防御性兜底）。
-                    None => app.status = Some("nothing to do".into()),
+                    None => app.status = Some(crate::i18n::t().nothing_to_do.into()),
                 },
                 Err(message) => {
                     app.refresh();
@@ -2026,7 +2062,10 @@ fn event_loop(
                 Ok(run) => app.note_rename_outcome(&request, &run),
                 Err(err) => {
                     app.refresh();
-                    app.status = Some(format!("rename failed: {err}"));
+                    app.status = Some(crate::i18n::fmt(
+                        crate::i18n::t().rename_failed_short,
+                        &[&err.to_string()],
+                    ));
                 }
             }
         }
@@ -2042,7 +2081,10 @@ fn event_loop(
                 Ok(run) => app.note_restart_outcome(&request, &run),
                 Err(err) => {
                     app.refresh();
-                    app.status = Some(format!("restart failed: {err}"));
+                    app.status = Some(crate::i18n::fmt(
+                        crate::i18n::t().restart_failed_short,
+                        &[&err.to_string()],
+                    ));
                 }
             }
         }
@@ -2199,11 +2241,12 @@ mod tests {
         assert_eq!(app.next_tick_in(), Duration::ZERO);
         assert!(!app.tick_due());
 
-        app.refresh_interval = Duration::from_millis(1);
+        app.refresh_interval = Duration::from_millis(20);
         app.refresh();
-        // 刚刷完：不该立刻 tick。
+        // 刚刷完：不该立刻 tick。（间隔不能取 1ms —— refresh 本身可能超过 1ms，
+        // 断言就永远轮不到「刚刷完」这个状态。）
         assert!(!app.tick_due());
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(50));
         assert!(app.tick_due());
 
         // 手动刷新把计时器重置。

@@ -14,7 +14,7 @@ use crate::app::App;
 pub fn render_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let lines: Vec<Line<'static>> = match app.sessions().get(app.selected) {
         None => vec![Line::from(Span::styled(
-            " nothing selected".to_string(),
+            crate::i18n::t().detail_nothing.to_string(),
             Style::default(),
         ))],
         Some(session) => crate::ui::layout::detail_lines(
@@ -30,7 +30,7 @@ pub fn render_panel(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(" Detail ")
+                .title(crate::i18n::t().detail_title)
                 .title_style(Style::default().add_modifier(Modifier::BOLD)),
         ),
         area,

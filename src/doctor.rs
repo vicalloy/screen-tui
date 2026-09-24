@@ -110,8 +110,9 @@ impl Report {
     }
 
     pub fn render(&self) -> String {
+        let t = crate::i18n::t();
         let mut out = String::new();
-        out.push_str("stui doctor — environment self-check\n");
+        out.push_str(t.d_title);
         out.push('\n');
 
         let mut name_width = 0usize;
@@ -128,7 +129,7 @@ impl Report {
 
             if let Some(fix) = &check.fix {
                 out.push_str(&" ".repeat(display_width(&head)));
-                out.push_str("fix: ");
+                out.push_str(t.d_fix);
                 out.push_str(fix);
                 out.push('\n');
             }
@@ -136,11 +137,16 @@ impl Report {
 
         let (pass, warn, fail) = self.counts();
         out.push('\n');
-        out.push_str(&format!("{pass} pass · {warn} warn · {fail} fail\n"));
+        out.push_str(&crate::i18n::fmt(
+            t.d_summary,
+            &[&pass.to_string(), &warn.to_string(), &fail.to_string()],
+        ));
+        out.push('\n');
 
         if !self.notes.is_empty() {
             out.push('\n');
-            out.push_str("notes:\n");
+            out.push_str(t.d_notes);
+            out.push('\n');
             for note in &self.notes {
                 out.push_str("  - ");
                 out.push_str(note);
@@ -190,80 +196,63 @@ pub fn run() -> Report {
             .notes
             .extend(c.probe_notes.iter().map(|n| format!("caps: {n}")));
     }
-    report.notes.push(
-        "check 11 is the only side-effecting one: it writes a real `-X hardcopy` to a 0600 \
-         temp file and removes it immediately."
-            .to_string(),
-    );
+    report.notes.push(crate::i18n::t().d_note11.to_string());
 
     report
 }
 
 // ---------------------------------------------------------------- 1
 fn check_screen_executable(program: &screen::Result<std::path::PathBuf>) -> Check {
+    let t = crate::i18n::t();
     match program {
-        Ok(path) => Check::pass("screen executable", path.display().to_string()),
-        Err(err) => Check::fail(
-            "screen executable",
-            err.to_string(),
-            "install GNU Screen: `apt install screen` (Debian/Ubuntu) | `yum install screen` (RHEL) | `brew install screen` (macOS)",
-        ),
+        Ok(path) => Check::pass(t.d_name_screen, path.display().to_string()),
+        Err(err) => Check::fail(t.d_name_screen, err.to_string(), t.d_screen_missing_fix),
     }
 }
 
 // ---------------------------------------------------------------- 2
 fn check_version(caps: &screen::Result<Caps>) -> Check {
+    let t = crate::i18n::t();
     let Ok(caps) = caps else {
-        return Check::fail(
-            "version",
-            "screen is not available, cannot determine the version",
-            "install GNU Screen first",
-        );
+        return Check::fail(t.d_name_version, t.d_version_na, t.d_install_screen);
     };
 
     let Some(version) = caps.version else {
+        let shown = if caps.version_line.is_empty() {
+            t.d_value_empty.to_string()
+        } else {
+            caps.version_line.clone()
+        };
         return Check::warn(
-            "version",
-            format!(
-                "cannot parse a version number from `screen -v` output: {}",
-                if caps.version_line.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    caps.version_line.clone()
-                }
-            ),
+            t.d_name_version,
+            crate::i18n::fmt(t.d_version_unparsed, &[&shown]),
         )
-        .with_fix("capability flags still come from live probes, so stui keeps working");
+        .with_fix(t.d_caps_live_fix);
     };
 
     // 版本号只用于展示；「功能是否降级」由实跑探测决定（tech-design §2 原则 2）。
     let detail = format!("{version} — {}", caps.version_line);
     match caps.query {
-        Support::Yes => Check::pass("version", format!("{detail}; `-Q` query available")),
-        Support::No => Check::warn(
-            "version",
-            format!(
-                "{detail}; `-Q` query unavailable on this build — window count/title need `-Q` \
-                 and will be hidden. Core functions are unaffected."
-            ),
-        )
-        .with_fix("no action needed; this is expected below Screen 4.6"),
+        Support::Yes => Check::pass(t.d_name_version, crate::i18n::fmt(t.d_q_ok, &[&detail])),
+        Support::No => Check::warn(t.d_name_version, crate::i18n::fmt(t.d_q_no, &[&detail]))
+            .with_fix(t.d_q_no_fix),
         Support::Unknown => Check::warn(
-            "version",
-            format!("{detail}; could not verify `-Q` (no session was available to test with)"),
+            t.d_name_version,
+            crate::i18n::fmt(t.d_q_unknown, &[&detail]),
         )
-        .with_fix("run `stui doctor` again while a session exists to get a definitive answer"),
+        .with_fix(t.d_q_unknown_fix),
     }
 }
 
 // ---------------------------------------------------------------- 3
 fn check_socket_dir(enumeration: &screen::Result<parse::Enumeration>) -> Check {
+    let t = crate::i18n::t();
     let e = match enumeration {
         Err(err) => {
             return Check::fail(
-                "socket dir",
-                format!("`screen -ls` failed: {err}"),
-                "check that $SCREENDIR and $TMPDIR are unset or non-empty — an empty value breaks every screen call; also verify the socket directory permissions",
+                t.d_name_socket,
+                crate::i18n::fmt(t.d_ls_failed, &[&err.to_string()]),
+                t.d_screendir_fix,
             );
         }
         Ok(e) => e,
@@ -272,98 +261,71 @@ fn check_socket_dir(enumeration: &screen::Result<parse::Enumeration>) -> Check {
     // 本机实测：$SCREENDIR 被导出为空值时 screen 仍能工作（回退到 $TMPDIR/.screen），
     // 但 capability 文档记录过它导致 `Cannot access ...` 的实例，故按 Warn 提示。
     if std::env::var_os("SCREENDIR").is_some_and(|v| v.is_empty()) {
-        return Check::warn(
-            "socket dir",
-            "`-ls` works, but $SCREENDIR is exported and EMPTY. It happens to be tolerated on \
-             this build (screen falls back to `$TMPDIR/.screen`), yet an empty SCREENDIR has \
-             caused `Cannot access ...` on other builds.",
-        )
-        .with_fix("unset SCREENDIR, or export it with a real path");
+        return Check::warn(t.d_name_socket, t.d_screendir_empty).with_fix(t.d_screendir_empty_fix);
     }
 
     let dir = e
         .list
         .socket_dir
         .clone()
-        .unwrap_or_else(|| "not reported by `-ls`".to_string());
-    Check::pass("socket dir", format!("`-ls` reachable; socket dir {dir}"))
+        .unwrap_or_else(|| t.d_not_reported.to_string());
+    Check::pass(t.d_name_socket, crate::i18n::fmt(t.d_socket_ok, &[&dir]))
 }
 
 // ---------------------------------------------------------------- 4
 fn check_enumeration(enumeration: &screen::Result<parse::Enumeration>) -> Check {
     use parse::Outlook;
 
+    let t = crate::i18n::t();
     let Ok(e) = enumeration else {
-        return Check::fail(
-            "session enumeration",
-            "cannot run `screen -q -ls`",
-            "fix the `screen executable` check first",
-        );
+        return Check::fail(t.d_name_enum, t.d_enum_cannot, t.d_fix_screen_first);
     };
 
     let count = e.count();
     match (e.outlook, count) {
         (Outlook::Unconnectable, n) => Check::warn(
-            "session enumeration",
-            format!(
-                "`-q -ls` exit 10: sessions exist but none are connectable ({n} listed); \
-                 the manual flags this as a permissions problem"
-            ),
+            t.d_name_enum,
+            crate::i18n::fmt(t.d_enum_exit10, &[&n.to_string()]),
         )
-        .with_fix("check ownership and permissions of the socket directory"),
+        .with_fix(t.d_enum_perm_fix),
         (Outlook::NoSessions, n) if n > 0 => Check::warn(
-            "session enumeration",
-            format!(
-                "`-q -ls` said no sessions (exit 9) but `-ls` listed {n}; trusting `-ls`. \
-                 The documented 9/10/11+ exit-code table is not reliable on every build."
-            ),
+            t.d_name_enum,
+            crate::i18n::fmt(t.d_enum_exit9, &[&n.to_string()]),
         ),
         (Outlook::Available(k), n) if k as usize != n => Check::warn(
-            "session enumeration",
-            format!("`-q -ls` reported {k} session(s) but `-ls` detailed {n}; trusting `-ls`"),
+            t.d_name_enum,
+            crate::i18n::fmt(t.d_enum_mismatch, &[&k.to_string(), &n.to_string()]),
         ),
         (Outlook::Inconclusive(code), n) => Check::warn(
-            "session enumeration",
-            format!(
-                "`-q -ls` exited {code}, which is outside the documented 9/10/11+ table \
-                 (measured on Screen 4.00.03: 8 with no sessions). stui falls back to parsing \
-                 `-ls` text; {n} session(s) found."
-            ),
+            t.d_name_enum,
+            crate::i18n::fmt(t.d_enum_code, &[&code.to_string(), &n.to_string()]),
         )
-        .with_fix("no action needed; recorded for the version-capability matrix"),
+        .with_fix(t.d_enum_code_fix),
         (outlook, n) => Check::pass(
-            "session enumeration",
-            format!("{n} session(s) · {}", outlook.label()),
+            t.d_name_enum,
+            crate::i18n::fmt(t.d_enum_ok, &[&n.to_string(), &outlook.label()]),
         ),
     }
 }
 
 // ---------------------------------------------------------------- 5
 fn check_terminfo() -> Check {
+    let t = crate::i18n::t();
     match run_quietly("infocmp", &["screen-256color"]) {
-        Some(status) if status.success() => Check::pass("terminfo", "`screen-256color` is present"),
+        Some(status) if status.success() => Check::pass(t.d_name_terminfo, t.d_ti_present),
         Some(status) => Check::warn(
-            "terminfo",
-            format!(
-                "`infocmp screen-256color` failed (exit {}); stui degrades to the plain `screen` \
-                 terminfo, and 256-color output inside sessions may not render",
-                status.code().unwrap_or(-1)
-            ),
+            t.d_name_terminfo,
+            crate::i18n::fmt(t.d_ti_failed, &[&status.code().unwrap_or(-1).to_string()]),
         )
-        .with_fix(
-            "install the ncurses terminfo extras: `apt install ncurses-term` (Debian/Ubuntu)",
-        ),
-        None => Check::warn(
-            "terminfo",
-            "`infocmp` is not available, cannot verify terminfo",
-        )
-        .with_fix("install ncurses-bin (Debian/Ubuntu) if you want this check to work"),
+        .with_fix(t.d_ti_fix),
+        None => Check::warn(t.d_name_terminfo, t.d_ti_missing).with_fix(t.d_ti_missing_fix),
     }
 }
 
 // ---------------------------------------------------------------- 6
 fn check_utf8() -> Check {
     const KEYS: [&str; 3] = ["LC_ALL", "LC_CTYPE", "LANG"];
+    let t = crate::i18n::t();
 
     let mut observed = Vec::new();
     let mut utf8 = false;
@@ -380,36 +342,25 @@ fn check_utf8() -> Check {
     }
 
     if utf8 {
-        return Check::pass("utf-8 locale", observed.join(" "));
+        return Check::pass(t.d_name_utf8, observed.join(" "));
     }
 
     if observed.is_empty() {
-        return Check::warn("utf-8 locale", "no locale variable is set").with_fix(
-            "export LANG=<your>.UTF-8; CJK and emoji session names may otherwise misalign",
-        );
+        return Check::warn(t.d_name_utf8, t.d_utf8_none).with_fix(t.d_utf8_none_fix);
     }
 
     Check::warn(
-        "utf-8 locale",
-        format!(
-            "locale is not UTF-8 ({}); CJK/emoji session names may render wrong or misalign",
-            observed.join(" ")
-        ),
+        t.d_name_utf8,
+        crate::i18n::fmt(t.d_utf8_not, &[&observed.join(" ")]),
     )
-    .with_fix(
-        "export LANG=<your>.UTF-8 (suggested, not applied): add `defutf8 on` to ~/.screenrc — \
-         stui never edits your screenrc",
-    )
+    .with_fix(t.d_utf8_fix)
 }
 
 // ---------------------------------------------------------------- 7
 fn check_dead_sessions(enumeration: &screen::Result<parse::Enumeration>) -> Check {
+    let t = crate::i18n::t();
     let Ok(e) = enumeration else {
-        return Check::fail(
-            "dead sessions",
-            "cannot enumerate sessions",
-            "fix the `screen executable` check first",
-        );
+        return Check::fail(t.d_name_dead, t.d_cannot_enum, t.d_fix_screen_first);
     };
 
     let dead: Vec<&str> = e
@@ -428,89 +379,70 @@ fn check_dead_sessions(enumeration: &screen::Result<parse::Enumeration>) -> Chec
 
     if dead.is_empty() {
         return Check::pass(
-            "dead sessions",
+            t.d_name_dead,
             if unreachable == 0 {
-                "none".to_string()
+                t.d_dead_none.to_string()
             } else {
-                format!(
-                    "none dead, but {unreachable} unreachable (display only, never connectable)"
-                )
+                crate::i18n::fmt(t.d_dead_unreachable, &[&unreachable.to_string()])
             },
         );
     }
 
     Check::warn(
-        "dead sessions",
-        format!(
-            "{} dead session(s): {} — they pollute the list and can be mis-clicked",
-            dead.len(),
-            dead.join(", ")
-        ),
+        t.d_name_dead,
+        crate::i18n::fmt(t.d_dead_list, &[&dead.len().to_string(), &dead.join(", ")]),
     )
-    .with_fix("run `screen -wipe` (or press `W` in the TUI) — stui always asks for confirmation")
+    .with_fix(t.d_dead_fix)
 }
 
 // ---------------------------------------------------------------- 8
 fn check_inside_screen() -> Check {
+    let t = crate::i18n::t();
     match std::env::var_os("STY").filter(|v| !v.is_empty()) {
-        None => Check::pass("screen nesting", "not running inside a screen session ($STY unset)"),
+        None => Check::pass(t.d_name_nesting, t.d_not_inside),
         Some(sty) => Check::warn(
-            "screen nesting",
-            format!(
-                "running inside a screen session (STY={}); screen refuses to attach from within \
-                 itself",
-                sty.to_string_lossy()
-            ),
+            t.d_name_nesting,
+            crate::i18n::fmt(t.d_inside, &[&sty.to_string_lossy()]),
         )
-        .with_fix(
-            "detach first, or use shared attachment (`-x`) which is the only mode that works from inside",
-        ),
+        .with_fix(t.d_inside_fix),
     }
 }
 
 // ---------------------------------------------------------------- 9
 fn check_terminal_size() -> Check {
+    let t = crate::i18n::t();
     match crossterm::terminal::size() {
         Ok((cols, rows)) => {
             if cols < 40 || rows < 10 {
                 Check::warn(
-                    "terminal size",
-                    format!(
-                        "{cols}x{rows} — very small; the TUI would fall back to the minimal layout \
-                         (only affects the TUI, not `ls` or `doctor`)"
-                    ),
+                    t.d_name_size,
+                    crate::i18n::fmt(t.d_size_small, &[&cols.to_string(), &rows.to_string()]),
                 )
             } else {
-                Check::pass("terminal size", format!("{cols}x{rows}"))
+                Check::pass(t.d_name_size, format!("{cols}x{rows}"))
             }
         }
         Err(err) => Check::warn(
-            "terminal size",
-            format!(
-                "cannot determine terminal size ({err}); stdout is probably not a TTY — \
-                 only the TUI needs it, `ls` and `doctor` do not"
-            ),
+            t.d_name_size,
+            crate::i18n::fmt(t.d_size_err, &[&err.to_string()]),
         ),
     }
 }
 
 // ---------------------------------------------------------------- 10
 fn check_config_writable() -> Check {
+    let t = crate::i18n::t();
     let Some((dir, source)) = config::config_dir() else {
-        return Check::fail(
-            "config directory",
-            "$HOME is unset and neither $SCREEN_TUI_HOME nor $XDG_CONFIG_HOME is usable",
-            "set $HOME, or point $SCREEN_TUI_HOME at a writable directory",
-        );
+        return Check::fail(t.d_name_config, t.d_config_missing, t.d_config_missing_fix);
     };
 
     let shown = format!("{} (from {})", dir.display(), source.label());
     match config::probe_writable(&dir) {
-        Ok(()) => Check::pass("config directory", format!("{shown} — writable, mode 0700")),
+        Ok(()) => Check::pass(t.d_name_config, crate::i18n::fmt(t.d_config_ok, &[&shown])),
         Err(err) => Check::fail(
-            "config directory",
-            format!("{shown} — write probe failed: {err}"),
-            format!("check ownership and permissions of {}", dir.display()),
+            t.d_name_config,
+            crate::i18n::fmt(t.d_config_fail, &[&shown, &err.to_string()]),
+            crate::i18n::fmt(t.d_config_perm_fix, &[&dir.display().to_string()]),
         ),
     }
 }
@@ -520,12 +452,9 @@ fn check_preview(
     caps: &screen::Result<Caps>,
     enumeration: &screen::Result<parse::Enumeration>,
 ) -> Check {
+    let t = crate::i18n::t();
     if let Err(err) = caps {
-        return Check::fail(
-            "preview ability",
-            err.to_string(),
-            "install GNU Screen first",
-        );
+        return Check::fail(t.d_name_preview, err.to_string(), t.d_install_screen);
     }
 
     let target = enumeration
@@ -535,48 +464,35 @@ fn check_preview(
         .map(|s| s.full.clone());
 
     let Some(full) = target else {
-        return Check::warn(
-            "preview ability",
-            "no connectable session available to test `-X hardcopy`; capability left unverified \
-             (nothing was written to disk)",
-        )
-        .with_fix(
-            "create a session (`screen -dmS probe sleep 60`) and re-run doctor to verify preview",
-        );
+        return Check::warn(t.d_name_preview, t.d_no_session_probe)
+            .with_fix(t.d_no_session_probe_fix);
     };
 
     match caps::probe_hardcopy(&full) {
         Ok(probe) => {
             let history = match probe.history {
-                Support::Yes => "history buffer (-h) available",
-                Support::No => "history buffer (-h) unavailable",
-                Support::Unknown => "history buffer (-h) unverified",
+                Support::Yes => t.d_hist_yes,
+                Support::No => t.d_hist_no,
+                Support::Unknown => t.d_hist_unknown,
             };
             match probe.hardcopy {
                 Support::Yes => Check::pass(
-                    "preview ability",
-                    format!("`-X hardcopy` works on {full} ({history})"),
+                    t.d_name_preview,
+                    crate::i18n::fmt(t.d_hc_ok, &[&full, history]),
                 ),
                 Support::No => Check::warn(
-                    "preview ability",
-                    format!(
-                        "`-X hardcopy` is unsupported on this build ({}); the preview pane will \
-                         show metadata only — never stale or fabricated content",
-                        probe.detail
-                    ),
+                    t.d_name_preview,
+                    crate::i18n::fmt(t.d_hc_no, &[&probe.detail]),
                 ),
                 Support::Unknown => Check::warn(
-                    "preview ability",
-                    format!(
-                        "could not verify `-X hardcopy` ({}); preview degrades to metadata only",
-                        probe.detail
-                    ),
+                    t.d_name_preview,
+                    crate::i18n::fmt(t.d_hc_unknown, &[&probe.detail]),
                 ),
             }
         }
         Err(err) => Check::warn(
-            "preview ability",
-            format!("hardcopy probe failed: {err}; preview degrades to metadata only"),
+            t.d_name_preview,
+            crate::i18n::fmt(t.d_hc_probe_failed, &[&err.to_string()]),
         ),
     }
 }

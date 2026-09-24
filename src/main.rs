@@ -12,6 +12,7 @@ mod app;
 mod cli;
 mod config;
 mod doctor;
+mod i18n;
 mod screen;
 mod ui;
 mod util;

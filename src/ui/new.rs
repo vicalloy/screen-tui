@@ -58,13 +58,11 @@ pub fn render_overlay(f: &mut Frame<'_>, draft: &NewDraft) {
         (None, None) => lines.push(Line::from("")),
     }
     lines.push(Line::from(""));
-    lines.push(dimmed_line(
-        " Tab/↓ next · ↑ back · Enter create · Esc cancel",
-    ));
+    lines.push(dimmed_line(crate::i18n::t().new_hint));
 
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" New session ")),
+        Paragraph::new(lines).block(Block::bordered().title(crate::i18n::t().new_title)),
         area,
     );
 }
@@ -88,16 +86,28 @@ fn focus_indicator(draft: &NewDraft) -> Line<'static> {
 }
 
 /// 字段行：标签右对齐到同一列；焦点字段加粗并带块状光标，其余整行暗色。
+///
+/// 标签文案走 i18n（FR-25），对齐宽度按**显示宽度**取三个标签的最大值
+/// （中文 `目录` 只有 4 列，不能沿用英文 Directory 的 9）。
 fn field_line(draft: &NewDraft, field: NewField) -> Line<'static> {
-    let (label, value) = match field {
-        NewField::Name => ("Name", &draft.name),
-        NewField::Dir => ("Directory", &draft.dir),
-        NewField::Command => ("Command", &draft.command),
+    use crate::util::width::display_width;
+
+    let label = field.label();
+    let value = match field {
+        NewField::Name => &draft.name,
+        NewField::Dir => &draft.dir,
+        NewField::Command => &draft.command,
     };
-    // ` label: ` 前缀按最长的 Directory（9 列）对齐，块状光标再占一列。
-    let prefix_cols = 1 + NewField::Dir.label().len() + 2;
+    // ` label: ` 前缀按最宽标签对齐，块状光标再占一列。
+    let label_width = [NewField::Name, NewField::Dir, NewField::Command]
+        .iter()
+        .map(|f| display_width(f.label()))
+        .max()
+        .unwrap_or(9);
+    let prefix_cols = 1 + label_width + 2;
     let value_cols = INNER_WIDTH.saturating_sub(prefix_cols + 1);
-    let label = format!("{label:>9}:");
+    let pad = " ".repeat(label_width.saturating_sub(display_width(label)));
+    let label = format!("{pad}{label}:");
     if field == draft.focus {
         Line::from(vec![
             Span::styled(

@@ -50,13 +50,16 @@ impl Status {
     }
 
     /// 规范化标签，未知状态原样透出。
+    ///
+    /// 展示文案走 i18n（FR-25）；`Status` 本身仍是纯数据，判定逻辑不看标签。
     pub fn label(&self) -> String {
+        let t = crate::i18n::t();
         match self {
-            Status::Detached => "detached".into(),
-            Status::Attached => "attached".into(),
-            Status::Multi => "multi".into(),
-            Status::Dead => "dead".into(),
-            Status::Unreachable => "unreachable".into(),
+            Status::Detached => t.st_detached.into(),
+            Status::Attached => t.st_attached.into(),
+            Status::Multi => t.st_multi.into(),
+            Status::Dead => t.st_dead.into(),
+            Status::Unreachable => t.st_unreachable.into(),
             Status::Unknown(raw) => raw.clone(),
         }
     }
@@ -106,13 +109,16 @@ impl Outlook {
     }
 
     pub fn label(&self) -> String {
+        let t = crate::i18n::t();
         match self {
-            Outlook::NoSessions => "no sessions (exit 9)".into(),
-            Outlook::Unconnectable => "sessions exist but none connectable (exit 10)".into(),
+            Outlook::NoSessions => t.outlook_no_sessions.into(),
+            Outlook::Unconnectable => t.outlook_unconnectable.into(),
             // 不含会话数：调用方通常已经单独展示了「N session(s)」，避免读成「3 session(s) · 3 session(s)」。
-            Outlook::Available(n) => format!("available (exit {})", n + 10),
+            Outlook::Available(n) => {
+                crate::i18n::fmt(t.outlook_available, &[&(n + 10).to_string()])
+            }
             Outlook::Inconclusive(code) => {
-                format!("inconclusive (exit {code}, outside the documented 9/10/11+ table)")
+                crate::i18n::fmt(t.outlook_inconclusive, &[&code.to_string()])
             }
         }
     }

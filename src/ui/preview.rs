@@ -17,14 +17,14 @@ pub fn render_pane(f: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let lines = match pane_lines(app) {
         Some(lines) => lines,
         None => vec![Line::from(Span::styled(
-            " press p to snapshot the selected session",
+            crate::i18n::t().preview_pane_hint.to_string(),
             theme::dimmed(),
         ))],
     };
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(" Preview ")
+                .title(crate::i18n::t().preview_title)
                 .title_style(Style::default().add_modifier(Modifier::BOLD)),
         ),
         area,
@@ -43,9 +43,9 @@ pub fn render_overlay(f: &mut ratatui::Frame<'_>, app: &App) {
     let area = crate::ui::centered_rect(f.area(), width, height);
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(format!(
-            " Preview - {} · fetched {} ",
-            view.name, view.fetched
+        Paragraph::new(lines).block(Block::bordered().title(crate::i18n::fmt(
+            crate::i18n::t().preview_overlay_title,
+            &[&view.name, &view.fetched],
         ))),
         area,
     );
@@ -65,11 +65,14 @@ fn pane_lines(app: &App) -> Option<Vec<Line<'static>>> {
 
 fn view_lines(view: &PreviewView) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        format!(" fetched {} · session {}", view.fetched, view.name),
+        crate::i18n::fmt(
+            crate::i18n::t().preview_fetched,
+            &[&view.fetched, &view.name],
+        ),
         theme::dimmed(),
     ))];
     if view.lines.is_empty() {
-        lines.push(Line::from(" (empty window)"));
+        lines.push(Line::from(crate::i18n::t().preview_empty));
     }
     for line in &view.lines {
         lines.push(Line::from(Span::raw(line.clone())));

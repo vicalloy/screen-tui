@@ -119,13 +119,10 @@ pub fn render(f: &mut ratatui::Frame<'_>, app: &App, area: Rect, tier: Tier) {
     let sessions = app.sessions();
     if sessions.is_empty() {
         let hint: String = if app.filter.is_empty() {
-            "No screen sessions. Press n to create one.".into()
+            crate::i18n::t().list_empty.into()
         } else {
             // 过滤后无命中：给出口（Esc 清空），不误报「没有会话」。
-            format!(
-                "No sessions match '/{}'. Esc clears the filter.",
-                app.filter
-            )
+            crate::i18n::fmt(crate::i18n::t().list_filter_empty, &[&app.filter])
         };
         f.render_widget(Paragraph::new(hint).style(theme::dimmed()), area);
         return;

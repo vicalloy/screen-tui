@@ -26,6 +26,21 @@ pub const HOME_ENV: &str = "SCREEN_TUI_HOME";
 /// 本工具理解的配置版本。更高的 `version` 一律只读（§8.3 第 3 条）。
 pub const CONFIG_VERSION: u32 = 1;
 
+/// `language` 字段的合法取值（FR-25）：`zh` / `en` / `auto`（跟随 locale）。
+pub fn default_language() -> String {
+    "auto".into()
+}
+
+/// 语言取值归一：`zh`/`en` 之外的值（含未知串）一律回退 `auto`，
+/// 保证写回的配置永远只用三种合法取值之一。
+pub fn normalize_language(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "zh" | "chinese" => "zh".into(),
+        "en" | "english" => "en".into(),
+        _ => default_language(),
+    }
+}
+
 // ------------------------------------------------------------- 结构定义
 
 /// 界面行为（§8.2 `ui`）。
@@ -123,6 +138,9 @@ pub struct Config {
     pub dirs: Vec<DirEntry>,
     /// 会话名 → 元数据。
     pub sessions: std::collections::BTreeMap<String, SessionMeta>,
+    /// 界面语言（FR-25）：`zh` / `en` / `auto`（跟随 locale 探测）。
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 fn default_max_recent_dirs() -> usize {
@@ -146,6 +164,7 @@ impl Config {
             max_recent_dirs: default_max_recent_dirs(),
             dirs: Vec::new(),
             sessions: std::collections::BTreeMap::new(),
+            language: default_language(),
         }
     }
 

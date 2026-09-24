@@ -68,6 +68,12 @@ pub struct LsArgs {
 /// 入口：解析参数并分发。
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
+    // 语言（FR-25）：读配置 `language`（auto 时探测 locale），进程内初始化一次。
+    // 配置读失败/损坏已由 config 层降级为默认值，此处只取语言，不关心 warnings
+    // （TUI 路径的 app::run 会再次加载并展示它们）。
+    crate::i18n::init(crate::i18n::Lang::detect(
+        &crate::config::load().config.language,
+    ));
     match cli.command {
         Some(Command::Ls(args)) => ls(&args),
         Some(Command::Doctor) => doctor_command(),
@@ -101,7 +107,7 @@ fn ls(args: &LsArgs) -> ExitCode {
 
     // 诊断信息一律走 stderr —— stdout 是给管道的（FR-22 验收 1）。
     for note in enumeration.notes() {
-        eprintln!("stui: note: {note}");
+        eprintln!("stui: {}: {note}", crate::i18n::t().note_label);
     }
 
     let machine_mode = !std::io::stdout().is_terminal() || args.no_header;
@@ -152,15 +158,26 @@ fn write_pretty_rows(enumeration: &Enumeration, args: &LsArgs) {
         .unwrap_or_else(|| "unknown".to_string());
 
     if count == 0 {
-        let _ = writeln!(out, "# no screen sessions found (socket dir {socket_dir})");
+        let _ = writeln!(
+            out,
+            "{}",
+            crate::i18n::fmt(crate::i18n::t().ls_no_sessions, &[&socket_dir])
+        );
         let _ = out.flush();
         return;
     }
 
     let _ = writeln!(
         out,
-        "# {count} session(s) · socket dir {socket_dir} · {}",
-        enumeration.outlook.label()
+        "{}",
+        crate::i18n::fmt(
+            crate::i18n::t().ls_summary,
+            &[
+                &count.to_string(),
+                &socket_dir,
+                &enumeration.outlook.label()
+            ]
+        )
     );
 
     // 名字列宽自适应，上限 32 列（超出按显示宽度裁剪，CJK/emoji 安全）。
@@ -179,29 +196,34 @@ fn write_pretty_rows(enumeration: &Enumeration, args: &LsArgs) {
         .iter()
         .any(|s| s.created.is_some());
 
-    let header = format!(
-        "{:<3} {:<w$} {:<11} {:<7}{}",
-        "IDX",
-        "NAME",
-        "STATUS",
-        "PID",
-        if with_created { " CREATED" } else { "" },
-        w = name_width
-    );
+    // 表头：各列沿用行渲染的列宽；标签按显示宽度补齐（中文列头 CJK 安全）。
+    let t = crate::i18n::t();
+    let mut header = String::new();
+    header.push_str(&pad_right(t.ls_col_idx, 3));
+    header.push(' ');
+    header.push_str(&pad_right(t.ls_col_name, name_width));
+    header.push(' ');
+    header.push_str(&pad_right(t.ls_col_status, 11));
+    header.push(' ');
+    header.push_str(&pad_right(t.ls_col_pid, 7));
+    if with_created {
+        header.push(' ');
+        header.push_str(t.ls_col_created);
+    }
     let _ = writeln!(out, "{}", header.trim_end());
 
     for (idx, session) in enumeration.list.sessions.iter().enumerate() {
         let name = clip_with_ellipsis(&sanitize(&session.name), name_width);
-        let mut line = format!(
-            "{:<3} {} {:<11} {:<7}",
-            idx + 1,
-            pad_right(&name, name_width),
-            sanitize(&session.status.label()),
-            session
+        let mut line = format!("{:<3} {} ", idx + 1, pad_right(&name, name_width),);
+        line.push_str(&pad_right(&sanitize(&session.status.label()), 11));
+        line.push(' ');
+        line.push_str(&pad_right(
+            &session
                 .pid
                 .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into())
-        );
+                .unwrap_or_else(|| "-".into()),
+            7,
+        ));
         if with_created {
             line.push(' ');
             line.push_str(session.created.as_deref().unwrap_or("-"));
