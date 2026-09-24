@@ -4,6 +4,7 @@
 //! stui            # TUI（M1 交付，当前给出明确提示）
 //! stui ls         # 纯文本会话列表（无 ANSI，可管道）
 //! stui doctor     # 环境自检（11 项）
+//! stui version    # 打印版本号
 //! stui --version
 //! ```
 //!
@@ -47,6 +48,8 @@ pub enum Command {
     Ls(LsArgs),
     /// Check the environment and print a report
     Doctor,
+    /// Print version information
+    Version,
 }
 
 #[derive(Debug, Args)]
@@ -68,11 +71,17 @@ pub fn run() -> ExitCode {
     match cli.command {
         Some(Command::Ls(args)) => ls(&args),
         Some(Command::Doctor) => doctor_command(),
+        Some(Command::Version) => version_command(),
         None => {
             // TUI（M1）：需要交互终端；非 TTY 下 app::run 会自行给出明确报错。
             ExitCode::from(crate::app::run())
         }
     }
+}
+
+fn version_command() -> ExitCode {
+    println!("stui {}", env!("CARGO_PKG_VERSION"));
+    ExitCode::from(EXIT_OK)
 }
 
 fn doctor_command() -> ExitCode {
@@ -233,6 +242,9 @@ mod tests {
 
         let cli = Cli::try_parse_from(["stui", "doctor"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Doctor)));
+
+        let cli = Cli::try_parse_from(["stui", "version"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Version)));
 
         let cli = Cli::try_parse_from(["stui"]).unwrap();
         assert!(cli.command.is_none());
