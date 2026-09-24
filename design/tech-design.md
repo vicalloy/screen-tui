@@ -155,7 +155,7 @@ fn attach(app: &mut App, s: &SessionRef, mode: AttachMode) -> Result<i32> {
 }
 ```
 
-**RAII 守护 `TuiGuard`**：`Drop` 里无条件还原终端；另设 `std::panic::set_hook`，panic 时先还原终端再走默认 hook（打印 panic 信息），保证崩溃后终端不报废。`SIGINT`/`SIGTERM` 注册 handler 走正常退出路径。
+**RAII 守护 `TuiGuard`**：`Drop` 里无条件还原终端；另设 `std::panic::set_hook`，panic 时先还原终端再走默认 hook（打印 panic 信息），保证崩溃后终端不报废。`SIGINT`/`SIGTERM` 注册 handler 走正常退出路径。进入备用屏幕（`enter`/`resume`）后先 `Clear(All)` 再首帧：ratatui 是 diff 渲染，不清屏的话备用屏幕上残留的旧内容（shell 输出 / 上次异常退出的画面）不会被覆盖。
 
 **尺寸问题**：接「共享连接」时提示「另一端窗口可能被压小」；「接管」后若尺寸异常，给出「按 `D` 断开对端再连」的提示（`-A` 自适应作为接管路径的默认参数）。
 

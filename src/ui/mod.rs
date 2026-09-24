@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -68,7 +69,7 @@ pub fn install_hooks() {
     install_signal_handlers();
 }
 
-/// RAII 终端守护：`enter()` 进入 raw mode + 备用屏幕并隐藏光标，
+/// RAII 终端守护：`enter()` 进入 raw mode + 备用屏幕（清屏）并隐藏光标，
 /// `Drop`（含 unwind 中的 panic 路径）无条件还原。
 ///
 /// `suspend()`/`resume()` 供连接闭环（T1.5）使用：把终端还给 screen 前台，
@@ -84,8 +85,10 @@ impl TuiGuard {
         enable_raw_mode()?;
         let mut out = io::stdout();
         // 不启用键盘增强协议（kitty protocol）—— 手机 SSH 客户端兼容优先（tech-design §2.2 要点 2）。
+        // 进入备用屏幕后立即清屏：ratatui 是 diff 渲染，只画非空格子，
+        // 备用屏幕上残留的旧内容（shell 输出 / 上次异常退出的画面）不会被覆盖。
         execute!(out, EnterAlternateScreen)?;
-        execute!(out, Hide)?;
+        execute!(out, TerminalClear(ClearType::All), Hide)?;
         Ok(Self { active: true })
     }
 
