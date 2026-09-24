@@ -1469,6 +1469,15 @@ impl App {
                     ));
                     return;
                 }
+                // 自身所在的会话不允许 kill（FR-13 v0.2 修订）：stui 就跑在里面，
+                // quit 等于把自己脚下的地板拆掉 —— 与状态无关，$STY 匹配即拒绝。
+                if kind == ActionKind::Kill && self.is_self_session(&session.full) {
+                    self.set_error(crate::i18n::fmt(
+                        crate::i18n::t().kill_self,
+                        &[&session.name],
+                    ));
+                    return;
+                }
                 self.confirm = Some(ConfirmAction {
                     kind,
                     target: session.full.clone(),
@@ -1554,19 +1563,29 @@ impl App {
                     Ok(())
                 }
             }
-            ActionKind::Kill => match found {
-                // attached/multi 拒绝 kill（新鲜状态复核，v0.2 修订）：会话正被
-                // 别的终端使用，-X quit 会连人带会话一起砍掉 —— 先断开再杀。
-                Some(Status::Attached | Status::Multi) => Err(crate::i18n::fmt(
-                    crate::i18n::t().kill_attached,
-                    &[&action.display],
-                )),
-                Some(_) => Ok(()),
-                None => Err(crate::i18n::fmt(
-                    crate::i18n::t().gone_kill,
-                    &[&action.display],
-                )),
-            },
+            ActionKind::Kill => {
+                // 自身所在的会话拒绝 kill（新鲜复核，与入口同款，FR-13 v0.2 修订）：
+                // stui 就跑在里面，quit 等于把自己脚下的地板拆掉，状态无关。
+                if self.self_sty.as_deref() == Some(action.target.as_str()) {
+                    return Err(crate::i18n::fmt(
+                        crate::i18n::t().kill_self,
+                        &[&action.display],
+                    ));
+                }
+                match found {
+                    // attached/multi 拒绝 kill（新鲜状态复核，v0.2 修订）：会话正被
+                    // 别的终端使用，-X quit 会连人带会话一起砍掉 —— 先断开再杀。
+                    Some(Status::Attached | Status::Multi) => Err(crate::i18n::fmt(
+                        crate::i18n::t().kill_attached,
+                        &[&action.display],
+                    )),
+                    Some(_) => Ok(()),
+                    None => Err(crate::i18n::fmt(
+                        crate::i18n::t().gone_kill,
+                        &[&action.display],
+                    )),
+                }
+            }
             ActionKind::Detach => match found {
                 Some(Status::Attached | Status::Multi) => Ok(()),
                 Some(other) => Err(crate::i18n::fmt(
@@ -3254,6 +3273,44 @@ mod tests {
             .validate_action(fresh, &action)
             .expect_err("attached kill must be refused");
         assert!(err.contains("kill refused"), "{err}");
+    }
+
+    #[test]
+    fn kill_entry_is_refused_for_self_session() {
+        // stui 就跑在目标会话里（$STY 匹配）：即便 -ls 状态滞后显示 Detached，
+        // kill 也要被拦 —— quit 等于拆自己脚下的地板（FR-13 v0.2 修订）。
+        let mut app = app_with(
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
+        );
+        app.self_sty = Some("12345.work".into());
+        app.selected = 0; // work
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(app.mode, Mode::Error);
+        assert!(app.take_action().is_none());
+        let message = app
+            .error_dialog
+            .as_deref()
+            .unwrap_or_default();
+        assert!(message.contains("you are inside"), "{message}");
+
+        // 确认弹层后回到列表，界面仍可用。
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::List);
+    }
+
+    #[test]
+    fn validate_action_refuses_kill_of_self_session_with_fresh_state() {
+        let mut app = app_with(FOUR);
+        // 键位时刻目标 detached（确认框放行），执行前才暴露 stui 就在里面。
+        app.self_sty = Some("12345.work".into());
+        let action = confirm_action(ActionKind::Kill, "12345.work");
+        let fresh = enumeration(
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n",
+        );
+        let err = app
+            .validate_action(fresh, &action)
+            .expect_err("self-session kill must be refused");
+        assert!(err.contains("you are inside"), "{err}");
     }
 
     #[test]
