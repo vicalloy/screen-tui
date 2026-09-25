@@ -20,6 +20,11 @@ use crate::ui;
 /// 刷新间隔（FR-19：默认 3 秒，介于 spv 的 1s 与 screen-manager 的 5s 之间）。
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
+/// kill 落账轮询：`-X quit` 的 server 收尾是异步的，紧随其后的 `screen -ls`
+/// 快照常常仍列出目标。轮询到目标消失才落账 —— 间隔与总上限如下。
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const KILL_POLL_LIMIT: Duration = Duration::from_secs(1);
+
 /// 事件轮询的最大等待。同时封顶「响应外部信号」的延迟。
 const POLL_CAP: Duration = Duration::from_millis(200);
 
@@ -716,6 +721,43 @@ impl App {
                     &[&err.to_string()],
                 ));
             }
+        }
+        self.last_refresh = Some(Instant::now());
+        self.refresh_meta();
+    }
+
+    /// kill 落账专用刷新：先轮询到目标从 `screen -ls` 里消失，再完成落账。
+    ///
+    /// 超时则如实采用最后一次枚举（目标可能仍以 dead 形态在列），不猜、不遮掩（C-5）。
+    fn refresh_after_kill(&mut self, target: &str) {
+        self.refresh_until_gone(target, KILL_POLL_INTERVAL, KILL_POLL_LIMIT);
+    }
+
+    /// [`refresh_after_kill`] 的可注入版（interval/limit 可调，单测零等待）。
+    fn refresh_until_gone(&mut self, target: &str, interval: Duration, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        loop {
+            match (self.enumerate)() {
+                Ok(enumeration) => {
+                    let gone = !enumeration.list.sessions.iter().any(|s| s.full == target);
+                    self.apply_enumeration(enumeration);
+                    if gone {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    // 枚举失败按 refresh() 同款口径：保留旧列表并报错。
+                    self.set_error(crate::i18n::fmt(
+                        crate::i18n::t().refresh_failed,
+                        &[&err.to_string()],
+                    ));
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(interval);
         }
         self.last_refresh = Some(Instant::now());
         self.refresh_meta();
@@ -1610,8 +1652,15 @@ impl App {
     }
 
     /// 动作结果落账：先刷新再给结论（refresh 会清瞬态消息，顺序不能反）。
+    ///
+    /// kill 例外：quit 的 server 收尾是异步的，立刻 `screen -ls` 仍会列出目标，
+    /// 直接落账就是「提示成功、列表残留」。改走轮询刷新，目标消失才收手。
     pub fn note_action_outcome(&mut self, action: &ConfirmAction, run: &cmd::Run) {
-        self.refresh();
+        if run.success() && action.kind == ActionKind::Kill {
+            self.refresh_after_kill(&action.target);
+        } else {
+            self.refresh();
+        }
         if run.success() {
             self.status = Some(match action.kind {
                 ActionKind::Wipe => crate::i18n::t().wiped.to_string(),
@@ -3494,6 +3543,58 @@ mod tests {
         let dialog = app.error_dialog.as_deref().unwrap_or_default();
         assert!(dialog.contains("kill"), "{dialog}");
         assert!(dialog.contains("exit 1"), "{dialog}");
+    }
+
+    /// kill 轮询替身的调用计数（fn 指针带不了状态，用静态计数器）。
+    static KILL_POLL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// 枚举替身：前两次仍列出目标（模拟 quit 收尾未完成），之后目标消失。
+    fn enumerate_kill_lingers_then_gone() -> crate::screen::Result<Enumeration> {
+        use std::sync::atomic::Ordering;
+        let n = KILL_POLL_CALLS.fetch_add(1, Ordering::SeqCst);
+        let text = if n < 2 {
+            "There is a screen on:\n\t12345.work\t(09/23/2026 10:00:00 AM)\t(Detached)\n1 Socket in /tmp/.screen.\n"
+        } else {
+            "No Sockets found in /tmp/.screen.\n"
+        };
+        Ok(enumeration(text))
+    }
+
+    #[test]
+    fn kill_outcome_polls_until_target_gone() {
+        use std::sync::atomic::Ordering;
+        KILL_POLL_CALLS.store(0, Ordering::SeqCst);
+        let mut app = app_with(FOUR);
+        app.enumerate = enumerate_kill_lingers_then_gone;
+        let action = confirm_action(ActionKind::Kill, "12345.work");
+        let ok_run = cmd::Run {
+            command: "screen -S 12345.work -X quit".into(),
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        app.note_action_outcome(&action, &ok_run);
+        // 前两次枚举目标仍在列，轮询到第三次（消失）才落账 —— 不是刷一次就完。
+        assert!(
+            KILL_POLL_CALLS.load(Ordering::SeqCst) >= 3,
+            "must poll until the target disappears"
+        );
+        assert!(!app.sessions().iter().any(|s| s.full == "12345.work"));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kill done")
+        );
+    }
+
+    #[test]
+    fn kill_poll_timeout_keeps_last_enumeration() {
+        let mut app = app_with(FOUR);
+        app.enumerate = fake_enumerate; // 目标永远在列
+        // limit = 0：立即超时。如实采用最后一次枚举（目标仍在），不假装消失（C-5）。
+        app.refresh_until_gone("12345.work", Duration::ZERO, Duration::ZERO);
+        assert!(app.sessions().iter().any(|s| s.full == "12345.work"));
     }
 
     // ------------------------------------------------------------- T2.5 过滤 / 数字直连 / 详情增强
