@@ -370,15 +370,19 @@ jobs:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v4
-      - run: cargo zigbuild --release --target ${{ matrix.target }}
+      - run: | # 镜像自带 Rust ~1.76 不认 edition 2024，与 Makefile build-linux 同款处理
+          rustup toolchain install 1.88.0 --profile minimal \
+            --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
+      - run: cargo +1.88.0 zigbuild --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with: { name: ${{ matrix.target }}, path: target/*/release/stui }
   macos:
-    runs-on: macos-latest          # arm64 原生
+    runs-on: macos-latest          # arm64 原生；x86_64 经 --target 交叉（Apple 工具链原生支持）
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0   # 与 Makefile RUST_PIN 锁同版本
+        with: { targets: "aarch64-apple-darwin, x86_64-apple-darwin" }
       - run: cargo build --release --target aarch64-apple-darwin
-      - run: rustup target add x86_64-apple-darwin
       - run: cargo build --release --target x86_64-apple-darwin
       - uses: actions/upload-artifact@v4
         with: { name: macos, path: target/*/release/stui }

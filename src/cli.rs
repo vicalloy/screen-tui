@@ -90,9 +90,10 @@ pub fn run() -> ExitCode {
         None => {
             // TUI（M1）：需要交互终端；非 TTY 下 app::run 会自行给出明确报错。
             // --attach-failed：失败回环重启，首帧弹出上一轮 attach 的失败原因。
-            let initial_error = cli.attach_failed.as_ref().map(|code| {
-                crate::i18n::fmt(crate::i18n::t().attach_exit_code, &[code])
-            });
+            let initial_error = cli
+                .attach_failed
+                .as_ref()
+                .map(|code| crate::i18n::fmt(crate::i18n::t().attach_exit_code, &[code]));
             ExitCode::from(crate::app::run(initial_error))
         }
     }

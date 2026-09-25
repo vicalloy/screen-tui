@@ -489,7 +489,11 @@ mod tests {
         let loaded = load_from(Some(&path));
         assert!(loaded.read_only, "higher version must be read-only");
         // refresh_ms 已废弃：旧配置里的未知字段被忽略，不报错、不进默认值。
-        assert_eq!(loaded.config.ui, UiConfig::default(), "unknown ui fields ignored");
+        assert_eq!(
+            loaded.config.ui,
+            UiConfig::default(),
+            "unknown ui fields ignored"
+        );
         assert_eq!(loaded.warnings.len(), 1);
         assert!(
             loaded.warnings[0].contains("read-only"),

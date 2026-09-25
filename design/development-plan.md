@@ -55,6 +55,10 @@ M0 出口：`make test` 全绿 + `make build-linux` 产物在真实 Linux 容器
    脚本与 CI 已按实测修正（原文档的 `v0.19.8` **不存在**，见 `tech-design.md` §6.2 要点 2/3）。
    2026-09-24 补充：镜像自带 Rust 不认 edition 2024，已在 `build-linux` 内改用 `cargo +1.88.0 zigbuild`
    （rustup 目录挂 `stui-rustup` 卷缓存，首次多下 ~100 MB）。
+   2026-09-25 补充：release.yml 的 linux job 原先直接 `cargo zigbuild`，会栽在同一个 edition 2024
+   问题上——已同步改为容器内先装 1.88.0 + 双 musl std 再 `cargo +1.88.0 zigbuild`；
+   ci.yml 与 release.yml 的 macOS job 工具链均锁死 `dtolnay/rust-toolchain@1.88.0`（与 RUST_PIN 一致）。
+   CI fmt 门禁失败已修：`cargo fmt` 重排 app.rs 内若干 `i18n::fmt(...)` 链与测试断言（纯格式，无语义改动）。
    补跑方式：`make build-linux && make verify-linux`。
 2. **T0.6 的 9 项**：需要一台真实 Linux 服务器（沙箱内 detached 会话被立即回收）。
    按计划要求，**T0.6 必须在 T1.5 验收前完成** —— 连接语义的正确性只能以实测为准。

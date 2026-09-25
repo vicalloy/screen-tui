@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
 use crossterm::terminal::{
-    Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode,
+    Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -189,7 +189,9 @@ fn render_error_dialog(f: &mut Frame<'_>, message: &str) {
     let msg_width = crate::util::width::display_width(message);
     // 长消息给 3/4 屏宽并让 Paragraph 折行；行数按折行后估算，保证完整可见。
     let max_width = (f.area().width * 3 / 4).max(24) as usize;
-    let width = (msg_width + 4).clamp(28, max_width).min(f.area().width as usize);
+    let width = (msg_width + 4)
+        .clamp(28, max_width)
+        .min(f.area().width as usize);
     let inner = width.saturating_sub(2).max(1);
     let msg_rows = msg_width.div_ceil(inner);
     let height = (msg_rows + 3) as u16 + 2; // 折行后消息 + 前后空行 + 提示行 + 边框
@@ -422,10 +424,9 @@ fn render_footer(f: &mut Frame<'_>, app: &App, tier: Tier, area: ratatui::layout
             // 刷新模式提示（FR-19 修订）：自动刷新关（默认）给手动提示，
             // 开（`$STUI_AUTO_REFRESH`）给当前间隔。
             let mut info = match app.refresh_interval {
-                Some(interval) => crate::i18n::fmt(
-                    t.footer_refresh,
-                    &[&interval.as_secs().to_string()],
-                ),
+                Some(interval) => {
+                    crate::i18n::fmt(t.footer_refresh, &[&interval.as_secs().to_string()])
+                }
                 None => t.footer_manual.to_string(),
             };
             if let Some(dir) = app.socket_dir() {

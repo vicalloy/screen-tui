@@ -221,11 +221,7 @@ fn bsd_comm(pid: u32) -> Option<String> {
             return None;
         }
         let comm = c_char_array_to_string(&info.pbi_comm);
-        if comm.is_empty() {
-            None
-        } else {
-            Some(comm)
-        }
+        if comm.is_empty() { None } else { Some(comm) }
     }
 }
 
@@ -263,11 +259,7 @@ fn proc_cwd(pid: u32) -> Option<String> {
             return None;
         }
         let path = c_char_array_to_string(&info.cdir_path);
-        if path.is_empty() {
-            None
-        } else {
-            Some(path)
-        }
+        if path.is_empty() { None } else { Some(path) }
     }
 }
 
@@ -420,10 +412,7 @@ mod tests {
         buf.extend_from_slice(&[0, 0, 0]); // 对齐填充
         buf.extend_from_slice(b"/bin/zsh\0-l\0");
         buf.extend_from_slice(b"HOME=/\0PATH=/bin\0"); // env 区，必须停在 argc=2
-        assert_eq!(
-            parse_procargs2(&buf).as_deref(),
-            Some("/bin/zsh -l")
-        );
+        assert_eq!(parse_procargs2(&buf).as_deref(), Some("/bin/zsh -l"));
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -469,6 +458,7 @@ mod tests {
             .expect("spawn sleep");
         let command = child_command_argv(std::process::id()).expect("child command found");
         child.kill().ok();
+        child.wait().ok(); // 收尸，避免 zombie（clippy::zombie_processes）
         assert!(command.starts_with("/bin/sleep"), "got: {command}");
     }
 

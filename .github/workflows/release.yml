@@ -11,8 +11,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # GHCR 上的 tag 不带 v 前缀；最高稳定版见 Makefile 注释
-  ZIGBUILD_IMG: ghcr.io/rust-cross/cargo-zigbuild:0.17.1
 
 jobs:
   linux:
@@ -25,8 +23,15 @@ jobs:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v4
+      # 镜像自带 Rust ~1.76，不认 edition 2024（Makefile 同款问题）：
+      # 装 1.88.0 minimal 工具链 + 双 musl std，再用 +1.88.0 调 zigbuild
+      - name: Install pinned toolchain (1.88.0 + musl std)
+        run: |
+          rustup set auto-self-update disable
+          rustup toolchain install 1.88.0 --profile minimal \
+            --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
       - name: Build (static musl)
-        run: cargo zigbuild --release --target ${{ matrix.target }}
+        run: cargo +1.88.0 zigbuild --release --target ${{ matrix.target }}
       - name: Assert static
         run: |
           n=$(readelf -d target/${{ matrix.target }}/release/stui | grep -c NEEDED || true)
@@ -40,10 +45,12 @@ jobs:
 
   macos:
     name: macos
-    runs-on: macos-latest
+    runs-on: macos-latest # arm64 原生（design §6.3：macOS 本机编译，不走 zigbuild 容器——容器内无 macOS SDK）
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # 工具链锁死 1.88.0（与 Makefile RUST_PIN 一致）；targets 一次装齐双 darwin std。
+      # arm64 runner 上 aarch64 是原生目标，x86_64 经 --target 交叉编译（Apple 工具链原生支持）。
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2

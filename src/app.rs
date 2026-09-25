@@ -874,10 +874,7 @@ impl App {
                     }
                     Some(_) => self.request_attach(AttachKind::Share, name),
                     None => {
-                        self.set_error(crate::i18n::fmt(
-                            crate::i18n::t().session_gone,
-                            &[&name],
-                        ));
+                        self.set_error(crate::i18n::fmt(crate::i18n::t().session_gone, &[&name]));
                     }
                 }
             }
@@ -1042,10 +1039,7 @@ impl App {
             .map(|full| self.is_self_session(full))
             .unwrap_or(false)
         {
-            self.set_error(crate::i18n::fmt(
-                crate::i18n::t().attach_self,
-                &[&name],
-            ));
+            self.set_error(crate::i18n::fmt(crate::i18n::t().attach_self, &[&name]));
             self.apply_enumeration(fresh);
             return;
         }
@@ -1065,10 +1059,7 @@ impl App {
                     }
                     // dead / unreachable 拒连（FR-03 表）。
                     Status::Dead => {
-                        self.set_error(crate::i18n::fmt(
-                            crate::i18n::t().dead_wipe_hint,
-                            &[&name],
-                        ));
+                        self.set_error(crate::i18n::fmt(crate::i18n::t().dead_wipe_hint, &[&name]));
                     }
                     Status::Unreachable => {
                         self.set_error(crate::i18n::fmt(
@@ -3363,10 +3354,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('K')));
         assert_eq!(app.mode, Mode::Error);
         assert!(app.take_action().is_none());
-        let message = app
-            .error_dialog
-            .as_deref()
-            .unwrap_or_default();
+        let message = app.error_dialog.as_deref().unwrap_or_default();
         assert!(message.contains("you are inside"), "{message}");
 
         // 确认弹层后回到列表，界面仍可用。
@@ -3748,7 +3736,10 @@ mod tests {
         app.refresh();
         // refresh 本身不再查窗口数（懒获取），窗口数保持 None 直到下次显示时抓取。
         assert!(app.window_count.is_none());
-        assert!(app.window_count_due(true).is_some(), "invalidated by manual refresh");
+        assert!(
+            app.window_count_due(true).is_some(),
+            "invalidated by manual refresh"
+        );
     }
 
     // ------------------------------------------------------------- T2.3 预览
