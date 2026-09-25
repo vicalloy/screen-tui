@@ -99,22 +99,28 @@ fn is_screen_binary(argv0: &str) -> bool {
 // 关键布局全部经过实测锚定（macOS 26.6 / 25G83，arm64），并有单测自检。
 
 /// `proc_pidinfo` flavor：`struct proc_bsdinfo`（pid / ppid / comm）。
+#[cfg(not(target_os = "linux"))]
 const PROC_PIDTBSDINFO: libc::c_int = 3;
 /// `proc_pidinfo` flavor：`struct proc_vnodepathinfo`（cwd）。
 ///
 /// 实测 macOS 26.6 为 9（老标头资料写作 11，实取 errno 84 不可用）；
 /// 单测 [`tests::proc_cwd_matches_current_dir`] 拿自身 pid 锚定布局，
 /// 系统升级若破坏布局该测试会失败，绝不静默给错路径。
+#[cfg(not(target_os = "linux"))]
 const PROC_PIDTVNODEPATHINFO: libc::c_int = 9;
 /// `sysctl` KERN_PROCARGS2：完整 argv（libc 常量表缺失，值取自 sys/sysctl.h）。
+#[cfg(not(target_os = "linux"))]
 const KERN_PROCARGS2: libc::c_int = 49;
 
+#[cfg(not(target_os = "linux"))]
 const MAXCOMLEN: usize = 16;
+#[cfg(not(target_os = "linux"))]
 const MAXPATHLEN: usize = 1024;
 
 /// macOS 实现：内核直读。子进程用 `proc_listchildpids` 定位（探测面最小），
 /// 完整命令行用 `KERN_PROCARGS2`（comm 只有 16 字节，只能当回退）；
 /// cwd 用 `proc_pidinfo(VNODEPATHINFO)`。
+#[cfg(not(target_os = "linux"))]
 pub fn macos_meta(pid: u32) -> Option<Meta> {
     let command = child_command_argv(pid);
     let cwd = proc_cwd(pid);
@@ -125,6 +131,7 @@ pub fn macos_meta(pid: u32) -> Option<Meta> {
 ///
 /// screen 自己的包装进程按 comm 跳过；argv 取不到（权限/刚退出）时回退到
 /// comm —— 那是内核给的真实进程名，不算猜（C-5）。
+#[cfg(not(target_os = "linux"))]
 fn child_command_argv(pid: u32) -> Option<String> {
     let children = proc_child_pids(pid)?;
     for child in children {
@@ -142,6 +149,7 @@ fn child_command_argv(pid: u32) -> Option<String> {
 /// `proc_listchildpids(ppid)`：直接子进程 pid 列表。失败返回 `None`。
 ///
 /// 带缓冲区调用返回 **pid 个数**（实测）；缓冲区不够时翻倍重试，上限 64K 个。
+#[cfg(not(target_os = "linux"))]
 fn proc_child_pids(ppid: u32) -> Option<Vec<u32>> {
     let mut capacity = 64usize;
     loop {
@@ -170,6 +178,7 @@ fn proc_child_pids(ppid: u32) -> Option<Vec<u32>> {
 
 /// `struct proc_bsdinfo`（proc_info.h）：全定长标量 + char 数组，无复杂嵌套。
 /// 布局经实测锚定（sizeof = 136，pbi_pid / pbi_ppid / pbi_comm 与自身进程一致）。
+#[cfg(not(target_os = "linux"))]
 #[repr(C)]
 struct ProcBsdInfo {
     pbi_flags: u32,
@@ -197,6 +206,7 @@ struct ProcBsdInfo {
 }
 
 /// `proc_pidinfo(PROC_PIDTBSDINFO)`：进程 comm。失败返回 `None`。
+#[cfg(not(target_os = "linux"))]
 fn bsd_comm(pid: u32) -> Option<String> {
     unsafe {
         let mut info: ProcBsdInfo = std::mem::zeroed();
@@ -223,6 +233,7 @@ fn bsd_comm(pid: u32) -> Option<String> {
 ///
 /// `pvi_cdir` = `vnode_info`(152B) + `vip_path`(1024B)，后面再跟一份 rdir；
 /// 152 是实测值（见 [`PROC_PIDTVNODEPATHINFO`] 注释），不用手写 vnode_stat。
+#[cfg(not(target_os = "linux"))]
 #[repr(C)]
 struct VnodePathInfo {
     cdir_info: [u8; VNODE_INFO_SIZE],
@@ -232,9 +243,11 @@ struct VnodePathInfo {
 }
 
 /// `struct vnode_info` 的实测大小（vnode_stat + fsid_t，arm64/x86_64 同布局）。
+#[cfg(not(target_os = "linux"))]
 const VNODE_INFO_SIZE: usize = 152;
 
 /// `proc_pidinfo(PROC_PIDTVNODEPATHINFO)`：进程 cwd。失败返回 `None`。
+#[cfg(not(target_os = "linux"))]
 fn proc_cwd(pid: u32) -> Option<String> {
     unsafe {
         let mut info: VnodePathInfo = std::mem::zeroed();
@@ -262,6 +275,7 @@ fn proc_cwd(pid: u32) -> Option<String> {
 ///
 /// mib 是 `[CTL_KERN, KERN_PROCARGS2, pid]`（挂在 CTL_KERN 直下，不在
 /// KERN_PROC 子树里），namelen 3。
+#[cfg(not(target_os = "linux"))]
 fn proc_argv(pid: u32) -> Option<String> {
     unsafe {
         let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, KERN_PROCARGS2, pid as libc::c_int];
@@ -300,6 +314,7 @@ fn proc_argv(pid: u32) -> Option<String> {
 ///
 /// 只取前 argc 个串按空格 join；argc 异常（0 / 超过实际串数）按实际能取到的算 ——
 /// 数据来自内核快照，截断好过丢弃。
+#[cfg(not(target_os = "linux"))]
 fn parse_procargs2(buf: &[u8]) -> Option<String> {
     if buf.len() < 5 {
         return None;
@@ -333,6 +348,7 @@ fn parse_procargs2(buf: &[u8]) -> Option<String> {
 }
 
 /// NUL 结尾的 `c_char` 数组转 String（非 UTF-8 字节 lossy 替换）。
+#[cfg(not(target_os = "linux"))]
 fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
     let bytes: Vec<u8> = chars
         .iter()
@@ -394,6 +410,8 @@ impl MetaCache {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn procargs2_parses_argv_and_stops_at_argc() {
         // 缓冲区布局：argc(4B) + exec_path + 对齐 NUL + argv... + env...（env 不取）。
@@ -408,6 +426,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn procargs2_rejects_empty_or_malformed_buffers() {
         assert_eq!(parse_procargs2(&[]), None);

@@ -2,7 +2,8 @@
 #
 # 打包发布物（tech-design §7 / T0.1）
 #
-#   dist/stui-<triple>              ← make build-linux / build-macos 的产物
+#   dist/stui-<triple>              ← make build-linux 的产物
+#   target/<triple>/release/stui    ← make build（本机原生）的产物
 #   ↓
 #   dist/screen-tui-v<ver>/stui-<arch>-<os>.tar.gz
 #   dist/screen-tui-v<ver>/SHA256SUMS
@@ -29,6 +30,8 @@ friendly_name() {
   case "$1" in
     x86_64-unknown-linux-musl)  echo "x86_64-linux" ;;
     aarch64-unknown-linux-musl) echo "aarch64-linux" ;;
+    x86_64-unknown-linux-gnu)   echo "x86_64-linux" ;;
+    aarch64-unknown-linux-gnu)  echo "aarch64-linux" ;;
     aarch64-apple-darwin)       echo "aarch64-macos" ;;
     x86_64-apple-darwin)        echo "x86_64-macos" ;;
     *) echo "" ;;
@@ -44,16 +47,29 @@ sha256_of() {
 }
 
 staged=0
+seen=""   # 已打包的 friendly name 列表（bash 3.2 无关联数组，用字符串判重）
 for triple in \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
+  x86_64-unknown-linux-gnu \
+  aarch64-unknown-linux-gnu \
   aarch64-apple-darwin \
   x86_64-apple-darwin
 do
   src="${DIST}/stui-${triple}"
   name="$(friendly_name "$triple")"
 
-  # macOS 本机构建的产物落在 target/<triple>/release/stui，也接受这个位置
+  # gnu 与 musl 的 linux 包名相同（stui-<arch>-linux.tar.gz）：先到先得，后者跳过
+  # 循环顺序 musl 在前 → 静态产物优先于本机 gnu 产物
+  case ",$seen," in
+    *",$name,"*)
+      echo "  skip  ${name}  (already packed)"
+      continue
+      ;;
+  esac
+
+  # 本机原生构建（make build）的产物落在 target/<triple>/release/stui，也接受这个位置
+  # 注意 gnu 与 musl 的 linux 同名：dist/ 优先（musl），无则回落 target/（gnu）
   if [ ! -f "$src" ] && [ -f "target/${triple}/release/stui" ]; then
     src="target/${triple}/release/stui"
   fi
@@ -87,12 +103,13 @@ EOF
   rm -rf "$work"
 
   echo "  pack  ${name}  ($(wc -c < "$tarball" | tr -d ' ') bytes)"
+  seen="$seen,$name"
   staged=$((staged + 1))
 done
 
 if [ "$staged" -eq 0 ]; then
   echo "package.sh: no artifacts found under ${DIST}/ or target/<triple>/release/" >&2
-  echo "            run \`make build-linux\` and/or \`make build-macos\` first." >&2
+  echo "            run \`make build-linux\` and/or \`make build\` first." >&2
   exit 1
 fi
 

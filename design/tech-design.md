@@ -310,37 +310,53 @@ stui --version
 
 ```makefile
 IMG     := ghcr.io/rust-cross/cargo-zigbuild:0.17.1
-TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+LINUX_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-.PHONY: build-linux build-macos release
+# 宿主机原生目标由 uname 推导（不假定 mac），可用 NATIVE_TARGET=<triple> 覆盖
+# Darwin/arm64 → aarch64-apple-darwin；Darwin/x86_64 → x86_64-apple-darwin
+# Linux        → x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
+
+.PHONY: build build-linux release
+
+build:   ## 本机原生编译（mac/linux 通用）
+	cargo build --release --target $(NATIVE_TARGET)
 
 build-linux:
 	docker run --rm -v $(CURDIR):/work -w /work \
 	  -v stui-cargo:/usr/local/cargo -v stui-target:/work/target \
-	  $(IMG) bash -c 'for t in $(TARGETS); do cargo zigbuild --release --target $$t; done'
+	  $(IMG) bash -c 'for t in $(LINUX_TARGETS); do cargo zigbuild --release --target $$t; done'
 	$(MAKE) extract-linux          # 把卷里的产物提取到 dist/
 
-build-macos:
-	cargo build --release --target aarch64-apple-darwin
-	cargo build --release --target x86_64-apple-darwin
-
-release: build-linux build-macos
+release: build-linux build
 	scripts/package.sh   # 归档 + SHA256SUMS，见 §7
 ```
+
+要点：
+
+0. **不假定宿主机是 macOS**：没有独立的 macos 构建目标，`make build` 即本机原生编译，目标由 `uname` 推导。mac 上产出 `target/<triple>-darwin/release/stui`，linux 上产出 gnu 目标产物；`package.sh` 对两类位置都能拾取。
 
 要点：
 
 1. `-w /work` 挂载源码，`stui-cargo` 卷持久化下载缓存，`stui-target` 卷持久化编译产物 —— 二次构建只重编改动部分。
 2. **镜像 tag 修正**：原文档写 `v0.19.8`，实测 `docker pull` 报 `not found`。
    GHCR 上的 tag **不带 `v` 前缀**，最高稳定版为 `0.17.1`（`Makefile` 与两个 workflow 已同步）。
-3. **产物位置修正**：原文档说「产物直接落在宿主机 `target/<triple>/release/`，无需从容器拷贝」，
+   **工具链补充修正**（实测）：`0.17.1` 镜像自带 Rust ~1.76，不认 `edition = "2024"`
+   （代码用了 let-chains，需要 Rust 1.88+，且 let-chains 仅 2024 edition 可用，不能降 edition 适配旧工具链）。
+   因此 `build-linux` 在容器内先 `rustup toolchain install 1.88.0 --profile minimal`（含双 musl std），
+   再以 `cargo +1.88.0 zigbuild` 构建；rustup 目录挂命名卷 `stui-rustup`，首次多下 ~100 MB，之后走缓存。
+3. **持久构建容器**：不用 `docker run --rm` 一次性容器，改用常驻容器 `stui-build`
+   （`ensure-container` 保证存在且运行：不存在则 `docker run -d ... sleep infinity`，停止则 `docker start`），
+   编译与产物提取都走 `docker exec`。镜像、rustup 工具链、cargo registry、target 增量全部跨次保留，
+   二次构建零下载。三个命名卷仍挂载在容器上 —— 删容器（`make clean-container`，如升级镜像后）重建时缓存不丢。
+   进入容器排查：`make build-shell`。
+4. **产物位置修正**：原文档说「产物直接落在宿主机 `target/<triple>/release/`，无需从容器拷贝」，
    但同一段又把 `stui-target` 命名卷挂在 `/work/target` 上 —— 命名卷不是宿主机目录，产物会留在卷里；
    更麻烦的是容器以 root 运行，直接写宿主机 `target/` 会留下 root 属主文件，让后续本机 `cargo build` 撞权限错误。
-   改为**两步**：容器内编译进卷 → 用 alpine 容器把产物 `cp` 到宿主机 `dist/stui-<triple>`（`make extract-linux`）。
+   改为**两步**：容器内编译进卷 → `docker exec` 把产物 `cp` 到宿主机 `dist/stui-<triple>`（`make extract-linux`）。
    `dist/` 只由本流水线写入，并用 `make clean-linux`（同样是容器）清理 root 属主文件。
-4. `cargo zigbuild` 传 `--target x86_64-unknown-linux-musl` 即静态链接，不需要额外 `RUSTFLAGS`；
+5. `cargo zigbuild` 传 `--target x86_64-unknown-linux-musl` 即静态链接，不需要额外 `RUSTFLAGS`；
    可用 `readelf -d | grep -c NEEDED == 0` 断言（`make verify-linux` 已内置）。
-5. 若不想依赖第三方镜像，备选方案是 `rust:alpine` 自装 `musl-tools` —— 但那样 **aarch64 需 QEMU 或另一台 arm 宿主机**，所以默认走 zigbuild。
+6. 若不想依赖第三方镜像，备选方案是 `rust:alpine` 自装 `musl-tools` —— 但那样 **aarch64 需 QEMU 或另一台 arm 宿主机**，所以默认走 zigbuild。
 
 ### 6.3 CI（GitHub Actions）
 
@@ -427,9 +443,9 @@ M0 就把 Docker 构建链跑通 —— 构建链是最容易在最后时刻爆�
 | 4 | 终端状态还原不彻底（panic/被 kill） | 用户终端报废，体验灾难 | RAII + panic hook + SIG handler 三重兜底；M1 验收必测 `kill -9` 后终端可用 |
 | 5 | 手机 SSH 客户端键盘差异（Esc 缺失、无 Ctrl） | 部分操作不可达 | 按键表以单字符为核心；Esc 功能均提供等价键（`q` 回退）；不依赖任何 Ctrl 组合 |
 | 6 | emoji/CJK 宽度错位 | 窄屏布局破坏 | `unicode-width` 全链路钳制；fixture 含 CJK 会话名样例 |
-| 7 | zigbuild 镜像版本漂移 | 构建不可复现 | 镜像 tag 锁死（`0.17.1`，GHCR 上**不带 v 前缀**），升级走显式 PR |
+| 7 | zigbuild 镜像版本漂移 | 构建不可复现 | 镜像 tag 锁死（`0.17.1`，GHCR 上**不带 v 前缀**），Rust 工具链同样锁死（`1.88.0`，Makefile `RUST_PIN`），升级走显式 PR |
 | 8 | docker 拉取镜像慢（实测 GHCR 单流约 424 KB/s，arm64 镜像 1091 MiB） | 首次构建耗时长 | 命名卷持久化 `/usr/local/cargo` 与 `/work/target`；镜像只需成功拉取一次 |
-| 9 | 本机 docker daemon 未启动（macOS 上的 Docker Desktop） | `make build-linux` 直接报 `Cannot connect to the Docker daemon` | 只有 linux 产物需要 docker；`make test` 与 `make build-macos` 均不依赖它 |
+| 9 | 本机 docker daemon 未启动（macOS 上的 Docker Desktop） | `make build-linux` 直接报 `Cannot connect to the Docker daemon` | 只有 linux 产物需要 docker；`make test` 与 `make build` 均不依赖它 |
 
 ---
 
@@ -439,7 +455,7 @@ M0 就把 Docker 构建链跑通 —— 构建链是最容易在最后时刻爆�
 screen-tui/
 ├── Cargo.toml            # [package] name = "screen-tui"，bin 名 stui
 ├── Cargo.lock            # 入库
-├── Makefile              # build-linux / extract-linux / verify-linux / build-macos / package / test / lint
+├── Makefile              # build / build-linux / extract-linux / verify-linux / package / test / lint
 ├── scripts/package.sh    # 归档 + SHA256SUMS
 ├── tests/fixtures/       # -ls 样本、screen -v 样本、畸形输入（含 README 标注每个样本的来源：实测/推导）
 ├── .github/workflows/    # ci.yml（fmt/clippy/test）+ release.yml（tag 触发）

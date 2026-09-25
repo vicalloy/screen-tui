@@ -22,7 +22,7 @@
 | 任务 | 内容 | 依赖 | 验收标准 | 状态 |
 | --- | --- | --- | --- | --- |
 | ~~T0.0 工程骨架~~ | cargo 工程 + 8 项依赖 + release profile | — | `cargo check`/`build` 通过 | ✅ 2026-09-23 |
-| T0.1 构建链 | `Makefile`（build-linux / build-macos / test / lint）+ `scripts/package.sh`；cargo-zigbuild 镜像出 musl 双目标 | T0.0 | ① `make build-linux` 产出 amd64+arm64 两个**静态**二进制；② 产物在 Alpine 容器内 `stui --version` 可执行；③ `make build-macos` 出双架构 | ⚠️ ③ 实测通过；①② 脚本就绪但**未跑通**（镜像 1091 MiB、GHCR 实测约 424 KB/s，见 §2.1） |
+| T0.1 构建链 | `Makefile`（build / build-linux / test / lint）+ `scripts/package.sh`；cargo-zigbuild 镜像出 musl 双目标；`make build` 按 uname 推导原生目标，不假定 mac | T0.0 | ① `make build-linux` 产出 amd64+arm64 两个**静态**二进制；② 产物在 Alpine 容器内 `stui --version` 可执行；③ `make build` 出本机原生架构产物 | ⚠️ ③ 实测通过；①② 脚本就绪但**未跑通**（镜像 1091 MiB、GHCR 实测约 424 KB/s，见 §2.1） |
 | T0.2 能力探测 | `screen::caps`：`-v` 版本解析、`-Q`/`hardcopy` 实探测 → `Caps` | T0.0 | 单测覆盖 `4.00.03`/`4.06.02`/`5.0.2`/非标准输出 4 组样本；代码中无版本号字面量比较 | ✅ 4 组样本 fixture 化并通过；`Support` 三态替代 `bool`；grep 确认无版本号比较 |
 | T0.3 会话解析 | `screen::parse`：`-q -ls` 退出码优先 + `-ls` 文本明细两级策略 | T0.0 | fixture ≥ 4 组（无日期/有日期/空列表/dead+unreachable）+ 畸形输入（空行、未知状态、超长名、重名）；解析失败返回 `Err` 不 panic | ✅ 6 组 fixture + 11 个解析单测；退出码改为「快路径 + 文本为准」（需求回改，见 §2.2） |
 | T0.4 `stui ls` | 纯文本子命令 + 退出码 0/1/2 | T0.2, T0.3 | 无 ANSI 输出可管道；无 TTY 时不输出控制序列 | ✅ 实测 stdout 中 ESC 字节数为 0；非 TTY 自动切机器格式（`--no-header` 同义） |
@@ -53,6 +53,8 @@ M0 出口：`make test` 全绿 + `make build-linux` 产物在真实 Linux 容器
    本机 docker daemon 需手动启动（已启动），镜像 arm64 变体共 **1091 MiB**，
    实测 GHCR 单流约 **424 KB/s**，首次拉取耗时过长，本次未跑完。
    脚本与 CI 已按实测修正（原文档的 `v0.19.8` **不存在**，见 `tech-design.md` §6.2 要点 2/3）。
+   2026-09-24 补充：镜像自带 Rust 不认 edition 2024，已在 `build-linux` 内改用 `cargo +1.88.0 zigbuild`
+   （rustup 目录挂 `stui-rustup` 卷缓存，首次多下 ~100 MB）。
    补跑方式：`make build-linux && make verify-linux`。
 2. **T0.6 的 9 项**：需要一台真实 Linux 服务器（沙箱内 detached 会话被立即回收）。
    按计划要求，**T0.6 必须在 T1.5 验收前完成** —— 连接语义的正确性只能以实测为准。
