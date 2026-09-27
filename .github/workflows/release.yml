@@ -56,10 +56,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target aarch64-apple-darwin
       - run: cargo build --release --target x86_64-apple-darwin
+      # 与 linux job 同构：按 target 上传单文件 artifact（根即文件本身），
+      # publish 侧对 4 个 target 用统一路径 artifacts/<triple>/stui。
+      # 不用 `target/*/release/stui` 打包上传——v4 以 LCA(target/) 为根，
+      # 内部保留 <triple>/release/ 层级，publish 对不上（v0.9.1 首跑教训）。
       - uses: actions/upload-artifact@v4
         with:
-          name: macos
-          path: target/*/release/stui
+          name: aarch64-apple-darwin
+          path: target/aarch64-apple-darwin/release/stui
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-apple-darwin
+          path: target/x86_64-apple-darwin/release/stui
           if-no-files-found: error
 
   publish:
@@ -75,18 +84,16 @@ jobs:
         with:
           path: artifacts
 
-      # macos artifact 以 LCA(target/) 为根，内部保留 <triple>/release/stui 层级；
-      # linux artifact 根即文件本身。find 同时兼容两种布局，缺包则显式失败，
-      # 不允许再静默出半个 Release（v0.9 曾因此缺 macos 包）。
+      # 四个 artifact 布局统一：artifacts/<triple>/stui（单文件 artifact，根即文件）。
+      # 缺任一 target 显式失败并列出实际文件树，不允许静默出半个 Release。
       - name: Arrange artifacts into dist/
         run: |
           set -eu
           mkdir -p dist
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
                    aarch64-apple-darwin x86_64-apple-darwin; do
-            f=$(find artifacts -type f -path "*/$t/stui" | head -1)
-            [ -n "$f" ] || { echo "MISSING: $t"; exit 1; }
-            cp "$f" "dist/stui-$t"
+            [ -f "artifacts/$t/stui" ] || { echo "MISSING: $t"; find artifacts -type f; exit 1; }
+            cp "artifacts/$t/stui" "dist/stui-$t"
           done
           ls -l dist
 
