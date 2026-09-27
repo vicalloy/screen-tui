@@ -75,17 +75,18 @@ jobs:
         with:
           path: artifacts
 
+      # macos artifact 以 LCA(target/) 为根，内部保留 <triple>/release/stui 层级；
+      # linux artifact 根即文件本身。find 同时兼容两种布局，缺包则显式失败，
+      # 不允许再静默出半个 Release（v0.9 曾因此缺 macos 包）。
       - name: Arrange artifacts into dist/
         run: |
           set -eu
           mkdir -p dist
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
                    aarch64-apple-darwin x86_64-apple-darwin; do
-            if [ -f "artifacts/$t/stui" ]; then
-              cp "artifacts/$t/stui" "dist/stui-$t"
-            elif [ -f "artifacts/macos/$t/stui" ]; then
-              cp "artifacts/macos/$t/stui" "dist/stui-$t"
-            fi
+            f=$(find artifacts -type f -path "*/$t/stui" | head -1)
+            [ -n "$f" ] || { echo "MISSING: $t"; exit 1; }
+            cp "$f" "dist/stui-$t"
           done
           ls -l dist
 
