@@ -1,83 +1,95 @@
 # stui
 
-一个管理 GNU Screen 会话的 TUI，为手机尺寸的 SSH 终端优化。
+English | [简体中文](README.zh.md)
 
-在 SSH（尤其是手机 SSH）里，把「记 PID、猜会话、敲一长串 `screen -r`」的操作，换成一块能看懂、能直接操作的面板。典型用途：用 Screen 兜住 CodeX / Claude Code 这类长跑 AI 任务，SSH 断了任务不死。
+A TUI for managing GNU Screen sessions, optimized for phone-sized SSH terminals.
 
-## 特性
+Over SSH — especially from a phone — stui replaces the "remember the PID, guess the session, type a long `screen -r` incantation" routine with a single panel you can read and act on. Typical use: keep long-running AI tasks (CodeX / Claude Code) inside Screen so they survive a dropped SSH connection.
 
-- **会话列表**：序号、会话名、状态（可用 / 已占用 / 多端 / 已死 / 不可达）、PID；4.6+ 还能显示创建时间。名字超宽先截断名字，绝不牺牲序号与状态列。
-- **新建会话**：默认值优先 —— 名字取当前目录名、目录取 `$PWD`、命令取 `$SHELL`，一屏落地，要改才展开。
-- **一键连接**：按会话状态自动分派 `-r` / `-d -r` / `-x`，不用记参数区别。已占用（attached / multi）默认直接接管，`x` 共享连接。
-- **只读预览**：`p` 通过 `hardcopy` 快照预览会话内容，绝不向会话注入按键。
-- **管理动作**：detach、kill、wipe、重命名，均有二次确认；dead 会话一键清理。
-- **环境自检**：`stui doctor` 逐项检查 screen 安装与配置，给出可行动的修复建议。
+## Features
 
-## 安装
+- **Session list**: index, name, status (detached / attached / multi / dead / unreachable), PID; creation time too on Screen 4.6+. Overly wide names are truncated first — the index and status columns are never sacrificed.
+- **New session**: sensible defaults first — name from the current directory, directory from `$PWD`, command from `$SHELL` — fits on one screen, expands only when you need to change something.
+- **One-key attach**: dispatches `-r` / `-d -r` / `-x` based on session state, so you never memorize the difference. Attached / multi sessions are taken over by default; `x` shares instead.
+- **Read-only preview**: `p` snapshots the session via `hardcopy` — never injects a single keystroke into it.
+- **Management actions**: detach, kill, wipe, rename — all with a confirmation step; one-key cleanup of dead sessions. Sessions created by stui record their directory and command, so a dead session can be relaunched as-is (`s`).
+- **Environment self-check**: `stui doctor` verifies the screen installation and configuration item by item, with actionable fixes.
 
-暂无包管理器分发，从源码构建：
+## Install
+
+On Linux (amd64 / arm64, statically linked with musl), grab a prebuilt binary from [GitHub Releases](https://github.com/vicalloy/screen-tui/releases/latest) (`SHA256SUMS` included):
+
+```sh
+curl -LO https://github.com/vicalloy/screen-tui/releases/latest/download/stui-x86_64-linux.tar.gz
+tar xzf stui-x86_64-linux.tar.gz && sudo mv stui /usr/local/bin/
+```
+
+On other platforms (macOS arm64 / x86_64, etc.), build from source:
 
 ```sh
 cargo build --release
 ```
 
-目标平台：linux/amd64、linux/arm64（musl 静态链接）、macOS arm64 / x86_64。
-
-## 使用
+## Usage
 
 ```sh
-stui            # 打开 TUI
-stui ls         # 纯文本会话列表（无 ANSI，可管道；非 TTY 自动切机器模式）
-stui ls --full  # 追加 <pid>.<name> 寻址列
-stui doctor     # 环境自检报告
+stui                  # open the TUI
+stui ls               # plain-text session list (no ANSI, pipe-safe; switches to machine mode when stdout is not a TTY)
+stui ls --no-header   # data rows only: no header, tab-separated
+stui ls --full        # append the <pid>.<name> address column
+stui doctor           # environment self-check report
+stui version          # print version
 ```
 
-`stui ls` 退出码：`0` 有会话 / `1` 无会话 / `2` 环境异常。
+`stui ls` exit codes: `0` sessions exist / `1` no sessions / `2` environment problem.
 
-### TUI 按键
+### TUI keys
 
-| 键 | 动作 |
+| Key | Action |
 | --- | --- |
-| `j`/`k` 或 `↑`/`↓` | 移动 |
-| `Enter` / `1`–`9` | 连接（已占用直接接管） |
-| `x` | 共享连接（`-x`） |
-| `p` | 只读预览 |
-| `n` | 新建会话 |
-| `i` | 会话详情 |
-| `/` | 过滤 |
-| `r` | 重命名 |
-| `D` / `K` / `W` | detach / kill / wipe（二次确认） |
-| `R` | 手动刷新 |
-| `?` | 帮助 |
-| `q` / `Esc` | 退出 / 返回 |
+| `j`/`k` or `↑`/`↓` | move |
+| `Enter` / `1`–`9` | attach (attached sessions are taken over) |
+| `x` | shared attach (`-x`) |
+| `p` | read-only preview |
+| `n` | new session |
+| `i` | session details |
+| `/` | filter |
+| `r` | rename |
+| `D` / `K` / `W` | detach / kill / wipe (with confirmation) |
+| `s` | restart a dead session (from the recorded directory and command) |
+| `X` | clean up metadata of stale sessions (aliases, favorites, etc.) |
+| `R` | manual refresh |
+| `?` | help |
+| `q` | quit |
+| `Esc` | back / cancel (inside overlays) |
 
-## 配置
+## Configuration
 
-配置文件位于标准位置（Linux: `~/.config/stui/config.json`；macOS: `~/Library/Application Support/stui/config.json`），可随时删除，工具不留痕。支持收藏目录（新建会话表单里 `1`–`9` 直选）、会话别名、界面语言（`zh` / `en` / `auto`）。
+The config file lives at `~/.config/screen-tui/config.json` (or `$XDG_CONFIG_HOME/screen-tui/` when set, or directly inside `$SCREEN_TUI_HOME` when set). Delete it at any time — the tool leaves no other trace. It stores favorite directories (hot-picked via `1`–`9` in the new-session form), session aliases, the directory/command records used for restarting, and the UI language (`zh` / `en` / `auto`).
 
-环境变量：
+Environment variables:
 
-| 变量 | 说明 |
+| Variable | Meaning |
 | --- | --- |
-| `STUI_LANG` | 覆盖界面语言（`zh` / `en`） |
-| `STUI_SCREEN` | 指定 screen 可执行文件路径（默认搜 `PATH`） |
-| `STUI_AUTO_REFRESH` | 自动刷新间隔（秒，正整数）；默认纯手动刷新 |
-| `SCREEN_TUI_HOME` | 覆盖配置目录 |
+| `STUI_LANG` | override the UI language (`zh` / `en`) |
+| `STUI_SCREEN` | path to the screen executable (defaults to searching `PATH`) |
+| `STUI_AUTO_REFRESH` | auto-refresh interval in seconds (positive integer); manual-only refresh by default |
+| `SCREEN_TUI_HOME` | override the config directory |
 
-## 兼容性
+## Compatibility
 
-兼容 GNU Screen 4.00.03 起（2006 年）的所有版本，包括 macOS 自带的旧版。只依赖 `-ls` / `-dmS` / `-r` / `-x` / `-d` / `-X` / `-wipe` 这套老接口；`-Q` 等新能力缺失时自动降级，不报错。
+Works with every GNU Screen from 4.00.03 (2006) onward, including the ancient copy bundled with macOS. It relies only on the veteran interface set `-ls` / `-dmS` / `-r` / `-x` / `-d` / `-X` / `-wipe`; newer capabilities such as `-Q` degrade gracefully when missing — no errors.
 
-设计约束：非侵入（不向会话写输入）、不动用户环境（不改 `.screenrc`、不装服务）、取不到的信息留空，绝不编造。
+Design constraints: non-invasive (never writes input to sessions), leaves your environment alone (never touches `.screenrc`, installs no services), and leaves fields blank rather than inventing data.
 
-## 设计文档
+## Design documents
 
-需求、技术方案、Screen 能力边界与参考项目分析见 [`design/`](design/) 目录：
+Requirements, technical design, Screen capability boundaries, and reference-project analysis live in [`design/`](design/):
 
-- [`design/requirements.md`](design/requirements.md) — 开发需求文档（FR / NFR）
-- [`design/tech-design.md`](design/tech-design.md) — 技术方案（Rust / ratatui 架构）
-- [`design/screen-capabilities.md`](design/screen-capabilities.md) — Screen 能力边界
-- [`design/reference-projects.md`](design/reference-projects.md) — 参考项目横向分析
+- [`design/requirements.md`](design/requirements.md) — requirements (FR / NFR)
+- [`design/tech-design.md`](design/tech-design.md) — technical design (Rust / ratatui architecture)
+- [`design/screen-capabilities.md`](design/screen-capabilities.md) — Screen capability boundaries
+- [`design/reference-projects.md`](design/reference-projects.md) — comparative analysis of reference projects
 
 ## License
 
