@@ -6,6 +6,8 @@ A TUI for managing GNU Screen sessions, optimized for phone-sized SSH terminals.
 
 Over SSH — especially from a phone — stui replaces the "remember the PID, guess the session, type a long `screen -r` incantation" routine with a single panel you can read and act on. Typical use: keep long-running AI tasks (CodeX / Claude Code) inside Screen so they survive a dropped SSH connection.
 
+![stui main view: session list, details, and read-only preview](screen/main.png)
+
 ## Features
 
 - **Session list**: index, name, status (detached / attached / multi / dead / unreachable), PID; creation time too on Screen 4.6+. Overly wide names are truncated first — the index and status columns are never sacrificed.
